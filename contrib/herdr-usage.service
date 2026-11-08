@@ -1,0 +1,14 @@
+[Unit]
+Description=herdr-usage: avisos de uso del plan de Claude en herdr
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/herdr-usage
+Environment=HERDR_BIN=%h/.local/bin/herdr
+Restart=on-failure
+RestartSec=30
+MemoryMax=32M
+Nice=10
+
+[Install]
+WantedBy=default.target
