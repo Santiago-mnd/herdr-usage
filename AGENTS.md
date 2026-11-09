@@ -1,9 +1,10 @@
 # AGENTS.md: herdr-usage
 
-- Lenguaje: Rust (edition 2024). Es una excepción a la regla global de TypeScript, aprobada por el owner el 8-nov-2026, porque es un daemon que vive todo el día (~3-5 MB contra ~40-60 MB de Node).
+- Lenguaje: Rust (edition 2024). Es una excepción a la regla global de TypeScript, aprobada por el owner el 8-nov-2026. Nació como daemon; desde la v0.2.0 es un plugin de herdr que corre un instante por evento, y se quedó en Rust por el binario chico y el arranque rápido.
 - Código en inglés; los textos que ven el owner y los agentes van en español.
-- `src/lib.rs`: lógica pura (lectura de sub-meter, decisión, textos) con pruebas. `src/main.rs`: entrada y salida (archivos, herdr, inotify, timer).
+- `herdr-plugin.toml`: manifest del plugin (startup y evento `pane.agent_status_changed`, los dos corren `herdr-usage hook`).
+- `src/lib.rs`: lógica pura (lectura de sub-meter, decisión, a qué panes avisar, sesión, timer, textos) con pruebas. `src/main.rs`: entrada y salida (archivos, candado, herdr, systemd-run).
 - Compilar con prioridad baja en el VPS: `nice -n 10 cargo build --release -j 2`.
-- Pruebas: `cargo test`. Para probar en vivo, `--dry-run` con `--meter` y `--state` apuntando a copias; nunca se edita el archivo real de sub-meter.
-- Nada se deja corriendo sin el visto bueno del owner (regla de procesos). El servicio está en `contrib/` y el README dice cómo apagarlo.
-- Decisiones e historia: engram, `idea/herdr-usage-alerts` (proyecto knowledge-vault).
+- Pruebas: `cargo test`. Para probar en vivo, `hook --dry-run` con `--meter` apuntando a una copia y `HERDR_PLUGIN_STATE_DIR` a una carpeta temporal; nunca se edita el archivo real de sub-meter.
+- Nada se deja corriendo sin el visto bueno del owner (regla de procesos). El único proceso programado es el timer de regreso de una sola vez; el README dice cómo verlo y cancelarlo.
+- Decisiones e historia: engram, `idea/herdr-usage-alerts` (proyecto knowledge-vault), y Linear SG-200.

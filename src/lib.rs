@@ -34,6 +34,56 @@ pub struct Wrap {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub wrap: Option<Wrap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_for: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Agent {
+    pub pane_id: String,
+    pub agent: String,
+    pub status: String,
+    pub session: Option<String>,
+}
+
+pub fn wrap_up_targets(agents: &[Agent], event_pane: Option<&str>) -> Vec<PaneRef> {
+    agents
+        .iter()
+        .filter(|agent| agent.agent == "claude")
+        .filter(|agent| {
+            let just_finished = Some(agent.pane_id.as_str()) == event_pane
+                && matches!(agent.status.as_str(), "idle" | "done");
+            agent.status == "working" || just_finished
+        })
+        .map(|agent| PaneRef {
+            pane_id: agent.pane_id.clone(),
+            session: agent.session.clone(),
+        })
+        .collect()
+}
+
+pub fn timer_needed(state: &State) -> Option<DateTime<Utc>> {
+    let resume_at = state.wrap.as_ref()?.resume_at;
+    (state.timer_for != Some(resume_at)).then_some(resume_at)
+}
+
+fn valid_session_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..")
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+pub fn session_from_socket(socket: Option<&str>) -> String {
+    socket
+        .and_then(|path| path.strip_suffix("/herdr.sock"))
+        .and_then(|dir| dir.rsplit_once('/'))
+        .filter(|(parent, _)| parent.ends_with("/sessions"))
+        .map(|(_, name)| name)
+        .filter(|name| valid_session_name(name))
+        .unwrap_or("default")
+        .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,10 +134,6 @@ pub fn evaluate(
         },
         (None, None) => Action::Nothing,
     }
-}
-
-pub fn next_deadline(state: &State) -> Option<DateTime<Utc>> {
-    state.wrap.as_ref().map(|wrap| wrap.resume_at)
 }
 
 pub fn kind_label(kind: &str) -> &str {
@@ -167,6 +213,7 @@ mod tests {
                 kinds: vec!["five_hour".into()],
                 panes: vec![],
             }),
+            timer_for: None,
         };
         assert_eq!(run(&limits, &state, 9), Action::Nothing);
     }
@@ -189,6 +236,7 @@ mod tests {
                     session: None,
                 }],
             }),
+            timer_for: None,
         };
         assert_eq!(run(&limits, &state, 11), Action::Resume);
     }
@@ -202,6 +250,7 @@ mod tests {
                 kinds: vec!["five_hour".into()],
                 panes: vec![],
             }),
+            timer_for: None,
         };
         assert_eq!(
             run(&limits, &state, 9),
@@ -210,6 +259,65 @@ mod tests {
                 kinds: vec!["five_hour".into(), "seven_day".into()]
             }
         );
+    }
+
+    fn agent(pane: &str, kind: &str, status: &str) -> Agent {
+        Agent {
+            pane_id: pane.into(),
+            agent: kind.into(),
+            status: status.into(),
+            session: Some(format!("s-{pane}")),
+        }
+    }
+
+    #[test]
+    fn targets_working_claude_and_the_pane_that_just_finished() {
+        let agents = [
+            agent("w1:p1", "claude", "working"),
+            agent("w1:p2", "claude", "idle"),
+            agent("w1:p3", "claude", "idle"),
+            agent("w1:p4", "codex", "working"),
+            agent("w1:p5", "claude", "blocked"),
+        ];
+        let targets: Vec<String> = wrap_up_targets(&agents, Some("w1:p2"))
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        assert_eq!(targets, ["w1:p1", "w1:p2"]);
+    }
+
+    #[test]
+    fn timer_is_armed_once_per_resume_time() {
+        let wrap = Wrap {
+            resume_at: at(10),
+            kinds: vec!["five_hour".into()],
+            panes: vec![],
+        };
+        let mut state = State {
+            wrap: Some(wrap),
+            timer_for: None,
+        };
+        assert_eq!(timer_needed(&state), Some(at(10)));
+        state.timer_for = Some(at(10));
+        assert_eq!(timer_needed(&state), None);
+        state.wrap.as_mut().unwrap().resume_at = at(20);
+        assert_eq!(timer_needed(&state), Some(at(20)));
+        assert_eq!(timer_needed(&State::default()), None);
+    }
+
+    #[test]
+    fn session_name_comes_from_the_socket_path() {
+        assert_eq!(session_from_socket(Some("/root/.config/herdr/herdr.sock")), "default");
+        assert_eq!(
+            session_from_socket(Some("/root/.config/herdr/sessions/blog/herdr.sock")),
+            "blog"
+        );
+        assert_eq!(
+            session_from_socket(Some("/root/.config/herdr/sessions/herdr/herdr.sock")),
+            "herdr"
+        );
+        assert_eq!(session_from_socket(Some("/x/sessions/a b/herdr.sock")), "default");
+        assert_eq!(session_from_socket(None), "default");
     }
 
     #[test]

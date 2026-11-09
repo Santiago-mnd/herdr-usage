@@ -1,0 +1,16 @@
+id = "herdr-usage"
+name = "herdr-usage"
+version = "0.2.0"
+min_herdr_version = "0.9.5"
+description = "Pide un cierre ordenado a los panes de Claude cuando el uso del plan llega al límite y los retoma cuando se reinicia"
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["target/release/herdr-usage", "hook"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["target/release/herdr-usage", "hook"]

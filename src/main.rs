@@ -1,61 +1,97 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::mpsc;
-use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Local, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use herdr_usage::{
-    Action, Limit, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, next_deadline,
-    parse_meter, wrap_up_prompt,
+    Action, Agent, Limit, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, parse_meter,
+    session_from_socket, timer_needed, wrap_up_prompt, wrap_up_targets,
 };
-use notify::{EventKind, RecursiveMode, Watcher};
 use serde_json::Value;
 
 const DEFAULT_METER: &str = ".claude/plugins/store/sub-meter_better-claude-3857a38a4680.json";
-const DEFAULT_STATE: &str = ".local/state/herdr-usage/state.json";
-const HELP: &str = "herdr-usage: vigila el uso del plan de Claude (archivo de sub-meter) y actúa sobre los panes de herdr.
+const FALLBACK_STATE_DIR: &str = ".local/state/herdr-usage";
+const TIMER_ENV: [&str; 4] = [
+    "HERDR_BIN_PATH",
+    "HERDR_SOCKET_PATH",
+    "HERDR_PLUGIN_STATE_DIR",
+    "HERDR_PLUGIN_ID",
+];
+const HELP: &str = "herdr-usage: plugin de herdr que vigila el uso del plan de Claude (archivo de sub-meter) y actúa sobre los panes.
 
-Uso: herdr-usage [opciones]
+Uso: herdr-usage <hook|status> [opciones]
+
+Comandos:
+  hook                evalúa el uso y actúa; lo llaman los eventos de herdr, el arranque y el timer de regreso
+  status              muestra lecturas, estado y lo que haría, sin actuar
 
 Opciones:
   --meter <ruta>      archivo de sub-meter (por defecto ~/.claude/plugins/store/sub-meter_…json)
-  --state <ruta>      archivo de estado (por defecto ~/.local/state/herdr-usage/state.json)
+  --state <ruta>      archivo de estado (por defecto <estado del plugin>/<sesión>.json)
   --threshold <n>     porcentaje que dispara el cierre ordenado (por defecto 90)
   --margin <min>      minutos de espera después del reinicio antes de retomar (por defecto 2)
-  --once              evalúa una sola vez y sale
-  --status            muestra lecturas, estado y lo que haría, sin actuar
-  --dry-run           imprime los comandos de herdr en vez de correrlos
+  --dry-run           imprime los comandos de herdr y de systemd en vez de correrlos
+  --only-pane <id>    para pruebas: el cierre solo se le pide a ese pane
   -h, --help          muestra esta ayuda";
 
+#[derive(PartialEq)]
+enum Mode {
+    Hook,
+    Status,
+}
+
 struct Config {
+    mode: Mode,
     meter: PathBuf,
     state: PathBuf,
     threshold: f64,
     margin: Duration,
-    once: bool,
-    status: bool,
     dry_run: bool,
     herdr: String,
+    session: String,
+    event: Option<String>,
+    event_pane: Option<String>,
+    only_pane: Option<String>,
 }
 
 fn home() -> PathBuf {
     env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+fn event_pane() -> Option<String> {
+    let raw = env::var("HERDR_PLUGIN_EVENT_JSON").ok()?;
+    let event: Value = serde_json::from_str(&raw).ok()?;
+    event["data"]["pane_id"].as_str().map(String::from)
+}
+
 fn parse_args() -> Result<Option<Config>, String> {
+    let session = session_from_socket(env::var("HERDR_SOCKET_PATH").ok().as_deref());
+    let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(FALLBACK_STATE_DIR));
+    let mut args = env::args().skip(1);
+    let mode = match args.next().as_deref() {
+        Some("hook") => Mode::Hook,
+        Some("status") => Mode::Status,
+        Some("-h" | "--help") | None => return Ok(None),
+        Some(other) => return Err(format!("comando desconocido: {other}")),
+    };
     let mut config = Config {
+        mode,
         meter: home().join(DEFAULT_METER),
-        state: home().join(DEFAULT_STATE),
+        state: state_dir.join(format!("{session}.json")),
         threshold: 90.0,
         margin: Duration::minutes(2),
-        once: false,
-        status: false,
         dry_run: false,
-        herdr: env::var("HERDR_BIN").unwrap_or_else(|_| "herdr".into()),
+        herdr: env::var("HERDR_BIN_PATH")
+            .or_else(|_| env::var("HERDR_BIN"))
+            .unwrap_or_else(|_| "herdr".into()),
+        session,
+        event: env::var("HERDR_PLUGIN_EVENT").ok(),
+        event_pane: event_pane(),
+        only_pane: None,
     };
-    let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("falta el valor de {name}"));
         match arg.as_str() {
@@ -72,9 +108,8 @@ fn parse_args() -> Result<Option<Config>, String> {
                     .map_err(|_| "--margin espera minutos enteros".to_string())?;
                 config.margin = Duration::minutes(minutes);
             }
-            "--once" => config.once = true,
-            "--status" => config.status = true,
             "--dry-run" => config.dry_run = true,
+            "--only-pane" => config.only_pane = Some(value("--only-pane")?),
             "-h" | "--help" => return Ok(None),
             other => return Err(format!("opción desconocida: {other}")),
         }
@@ -86,6 +121,19 @@ fn log(message: &str) {
     eprintln!("{} {message}", Local::now().format("%Y-%m-%d %H:%M:%S"));
 }
 
+fn lock_state(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 fn load_state(path: &Path) -> State {
     fs::read_to_string(path)
         .ok()
@@ -94,9 +142,6 @@ fn load_state(path: &Path) -> State {
 }
 
 fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
     fs::rename(tmp, path)
@@ -134,15 +179,16 @@ impl Herdr<'_> {
         self.query(args).map(|_| ())
     }
 
-    fn working_claude_panes(&self) -> Result<Vec<PaneRef>, String> {
+    fn agents(&self) -> Result<Vec<Agent>, String> {
         let list = self.query(&["agent", "list"])?;
         let agents = list["result"]["agents"].as_array().cloned().unwrap_or_default();
         Ok(agents
             .iter()
-            .filter(|agent| agent["agent"] == "claude" && agent["agent_status"] == "working")
             .filter_map(|agent| {
-                Some(PaneRef {
+                Some(Agent {
                     pane_id: agent["pane_id"].as_str()?.to_string(),
+                    agent: agent["agent"].as_str().unwrap_or_default().to_string(),
+                    status: agent["agent_status"].as_str().unwrap_or_default().to_string(),
                     session: agent["agent_session"]["value"].as_str().map(String::from),
                 })
             })
@@ -179,7 +225,7 @@ fn kinds_text(kinds: &[String]) -> String {
     kinds.iter().map(|kind| kind_label(kind)).collect::<Vec<_>>().join(" y ")
 }
 
-fn when_text(moment: chrono::DateTime<Utc>) -> String {
+fn when_text(moment: DateTime<Utc>) -> String {
     let local = moment.with_timezone(&Local);
     if local.date_naive() == Local::now().date_naive() {
         local.format("%H:%M").to_string()
@@ -188,14 +234,17 @@ fn when_text(moment: chrono::DateTime<Utc>) -> String {
     }
 }
 
-fn wrap_up(herdr: &Herdr, limits: &[Limit], kinds: Vec<String>, resume_at: chrono::DateTime<Utc>) -> Wrap {
+fn wrap_up(config: &Config, herdr: &Herdr, limits: &[Limit], kinds: Vec<String>, resume_at: DateTime<Utc>) -> Wrap {
     let text = wrap_up_prompt(limits, &kinds);
-    let panes = herdr.working_claude_panes().unwrap_or_else(|err| {
+    let agents = herdr.agents().unwrap_or_else(|err| {
         log(&format!("no pude listar los agentes: {err}"));
         Vec::new()
     });
     let mut reached = Vec::new();
-    for pane in panes {
+    let targets = wrap_up_targets(&agents, config.event_pane.as_deref())
+        .into_iter()
+        .filter(|pane| config.only_pane.as_ref().is_none_or(|only| &pane.pane_id == only));
+    for pane in targets {
         match herdr.prompt(&pane.pane_id, &text) {
             Ok(()) => reached.push(pane),
             Err(err) => log(&format!("no pude avisar a {}: {err}", pane.pane_id)),
@@ -238,38 +287,135 @@ fn resume(herdr: &Herdr, wrap: &Wrap) {
     log(&body);
 }
 
-fn tick(config: &Config, herdr: &Herdr, mut state: State) -> State {
-    let limits = match read_limits(&config.meter) {
-        Ok(limits) => limits,
-        Err(err) => {
-            log(&err);
-            Vec::new()
-        }
-    };
-    let action = evaluate(&limits, &state, Utc::now(), config.threshold, config.margin);
-    if config.status {
-        for limit in &limits {
-            println!(
-                "{}: {:.0} %, se reinicia {}",
-                kind_label(&limit.kind),
-                limit.percent_used,
-                limit.resets_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-            );
-        }
-        println!("estado: {}", serde_json::to_string(&state).unwrap_or_default());
-        println!("haría: {action:?}");
-        return state;
+fn timer_unit(session: &str, at: DateTime<Utc>) -> String {
+    format!("herdr-usage-resume-{session}-{}", at.timestamp())
+}
+
+fn timer_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", &format!("{unit}.timer")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn run_or_print(config: &Config, program: &str, args: &[String]) -> Result<(), String> {
+    if config.dry_run {
+        log(&format!("[dry-run] {program} {}", args.join(" ")));
+        return Ok(());
     }
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("no pude correr {program}: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn cancel_timer(config: &Config, at: DateTime<Utc>) {
+    let unit = format!("{}.timer", timer_unit(&config.session, at));
+    let _ = run_or_print(config, "systemctl", &["--user".into(), "stop".into(), unit]);
+}
+
+fn arm_timer(config: &Config, at: DateTime<Utc>) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|err| format!("no sé dónde está el binario: {err}"))?;
+    let mut args: Vec<String> = vec![
+        "--user".into(),
+        "--collect".into(),
+        "--quiet".into(),
+        "--unit".into(),
+        timer_unit(&config.session, at),
+        "--on-calendar".into(),
+        at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        "--timer-property=AccuracySec=1s".into(),
+    ];
+    args.extend(
+        TIMER_ENV
+            .iter()
+            .filter_map(|key| env::var(key).ok().map(|value| format!("--setenv={key}={value}"))),
+    );
+    args.extend([
+        exe.display().to_string(),
+        "hook".into(),
+        "--meter".into(),
+        config.meter.display().to_string(),
+        "--state".into(),
+        config.state.display().to_string(),
+        "--threshold".into(),
+        config.threshold.to_string(),
+        "--margin".into(),
+        config.margin.num_minutes().to_string(),
+    ]);
+    run_or_print(config, "systemd-run", &args)
+}
+
+fn sync_timer(config: &Config, state: &mut State) {
+    let Some(wrap) = state.wrap.as_ref() else {
+        state.timer_for = None;
+        return;
+    };
+    if config.event.as_deref() == Some("startup") && !timer_active(&timer_unit(&config.session, wrap.resume_at)) {
+        state.timer_for = None;
+    }
+    let Some(at) = timer_needed(state) else {
+        return;
+    };
+    if let Some(previous) = state.timer_for {
+        cancel_timer(config, previous);
+    }
+    match arm_timer(config, at) {
+        Ok(()) => {
+            state.timer_for = Some(at);
+            log(&format!("timer de regreso armado para {}", when_text(at)));
+        }
+        Err(err) => log(&format!("no pude armar el timer de regreso: {err}")),
+    }
+}
+
+fn status(config: &Config, limits: &[Limit], state: &State, action: &Action) {
+    for limit in limits {
+        println!(
+            "{}: {:.0} %, se reinicia {}",
+            kind_label(&limit.kind),
+            limit.percent_used,
+            limit.resets_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+        );
+    }
+    println!("sesión: {}", config.session);
+    println!("estado ({}): {}", config.state.display(), serde_json::to_string(state).unwrap_or_default());
+    if let Some(at) = state.timer_for {
+        let unit = timer_unit(&config.session, at);
+        let active = if timer_active(&unit) { "activo" } else { "no está activo" };
+        println!("timer: {unit}.timer, {active}");
+    }
+    println!("haría: {action:?}");
+}
+
+fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
+    let _lock = lock_state(&config.state).map_err(|err| format!("no pude tomar el candado del estado: {err}"))?;
+    let before = load_state(&config.state);
+    let limits = read_limits(&config.meter).unwrap_or_else(|err| {
+        log(&err);
+        Vec::new()
+    });
+    let action = evaluate(&limits, &before, Utc::now(), config.threshold, config.margin);
+    if config.mode == Mode::Status {
+        status(config, &limits, &before, &action);
+        return Ok(());
+    }
+    let mut state = before.clone();
     match action {
-        Action::Nothing => return state,
+        Action::Nothing => {}
         Action::WrapUp { resume_at, kinds } => {
-            state.wrap = Some(wrap_up(herdr, &limits, kinds, resume_at));
+            state.wrap = Some(wrap_up(config, herdr, &limits, kinds, resume_at));
         }
         Action::Extend { resume_at, kinds } => {
             if let Some(wrap) = state.wrap.as_mut() {
                 wrap.resume_at = resume_at;
                 wrap.kinds = kinds;
-                log(&format!("el reinicio se recorre a {}", resume_at.with_timezone(&Local)));
+                log(&format!("el reinicio se recorre a {}", when_text(resume_at)));
             }
         }
         Action::Resume => {
@@ -278,52 +424,15 @@ fn tick(config: &Config, herdr: &Herdr, mut state: State) -> State {
             }
         }
     }
+    sync_timer(config, &mut state);
+    if state == before {
+        return Ok(());
+    }
     if config.dry_run {
         log(&format!("[dry-run] estado nuevo: {}", serde_json::to_string(&state).unwrap_or_default()));
-    } else if let Err(err) = save_state(&config.state, &state) {
-        log(&format!("no pude guardar el estado: {err}"));
+        return Ok(());
     }
-    state
-}
-
-fn watch(config: &Config, herdr: &Herdr) -> Result<(), String> {
-    let dir = config.meter.parent().ok_or("la ruta de sub-meter no tiene carpeta")?;
-    let name = config.meter.file_name().map(|name| name.to_os_string());
-    let (sender, receiver) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if let Ok(event) = event {
-            let relevant = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
-                && event.paths.iter().any(|path| path.file_name().map(|n| n.to_os_string()) == name);
-            if relevant {
-                let _ = sender.send(());
-            }
-        }
-    })
-    .map_err(|err| format!("no pude crear el vigilante de archivos: {err}"))?;
-    watcher
-        .watch(dir, RecursiveMode::NonRecursive)
-        .map_err(|err| format!("no pude vigilar {}: {err}", dir.display()))?;
-    log(&format!("vigilando {} (umbral {:.0} %)", config.meter.display(), config.threshold));
-
-    let mut state = tick(config, herdr, load_state(&config.state));
-    loop {
-        let received = match next_deadline(&state) {
-            Some(deadline) => {
-                let wait = (deadline - Utc::now()).to_std().unwrap_or(StdDuration::ZERO);
-                match receiver.recv_timeout(wait) {
-                    Ok(()) => true,
-                    Err(mpsc::RecvTimeoutError::Timeout) => false,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("se cerró el vigilante".into()),
-                }
-            }
-            None => receiver.recv().map(|_| true).map_err(|_| "se cerró el vigilante".to_string())?,
-        };
-        if received {
-            std::thread::sleep(StdDuration::from_millis(300));
-            while receiver.try_recv().is_ok() {}
-        }
-        state = tick(config, herdr, state);
-    }
+    save_state(&config.state, &state).map_err(|err| format!("no pude guardar el estado: {err}"))
 }
 
 fn main() -> ExitCode {
@@ -339,11 +448,7 @@ fn main() -> ExitCode {
         }
     };
     let herdr = Herdr { bin: &config.herdr, dry_run: config.dry_run };
-    if config.once || config.status {
-        tick(&config, &herdr, load_state(&config.state));
-        return ExitCode::SUCCESS;
-    }
-    match watch(&config, &herdr) {
+    match hook(&config, &herdr) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log(&err);
