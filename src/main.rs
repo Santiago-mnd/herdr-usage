@@ -1,33 +1,36 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Duration, Local, Utc};
 use herdr_usage::{
-    Action, Agent, Limit, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, parse_meter,
-    session_from_socket, timer_needed, wrap_up_prompt, wrap_up_targets,
+    Action, Agent, Limit, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, limits_from_statusline,
+    merge_limits, meter_json, parse_meter, render_meter, session_from_socket, timer_needed, wrap_up_prompt,
+    wrap_up_targets,
 };
 use serde_json::Value;
 
-const DEFAULT_METER: &str = ".claude/plugins/store/sub-meter_better-claude-3857a38a4680.json";
-const FALLBACK_STATE_DIR: &str = ".local/state/herdr-usage";
+const PLUGIN_STATE_SUBDIR: &str = "herdr/plugins/herdr-usage";
+const METER_FILE: &str = "meter/claude.json";
 const TIMER_ENV: [&str; 4] = [
     "HERDR_BIN_PATH",
     "HERDR_SOCKET_PATH",
     "HERDR_PLUGIN_STATE_DIR",
     "HERDR_PLUGIN_ID",
 ];
-const HELP: &str = "herdr-usage: plugin de herdr que vigila el uso del plan de Claude (archivo de sub-meter) y actúa sobre los panes.
+const HELP: &str = "herdr-usage: plugin de herdr que mide el uso del plan de Claude y actúa sobre los panes.
 
-Uso: herdr-usage <hook|status> [opciones]
+Uso: herdr-usage <hook|status|statusline> [opciones]
 
 Comandos:
   hook                evalúa el uso y actúa; lo llaman los eventos de herdr, el arranque y el timer de regreso
   status              muestra lecturas, estado y lo que haría, sin actuar
+  statusline          statusline de Claude Code: lee el JSON por stdin, guarda el uso y dibuja la barra
 
 Opciones:
-  --meter <ruta>      archivo de sub-meter (por defecto ~/.claude/plugins/store/sub-meter_…json)
+  --meter <ruta>      archivo de uso (por defecto <estado del plugin>/meter/claude.json)
   --state <ruta>      archivo de estado (por defecto <estado del plugin>/<sesión>.json)
   --threshold <n>     porcentaje que dispara el cierre ordenado (por defecto 90)
   --margin <min>      minutos de espera después del reinicio antes de retomar (por defecto 2)
@@ -39,6 +42,7 @@ Opciones:
 enum Mode {
     Hook,
     Status,
+    Statusline,
 }
 
 struct Config {
@@ -59,6 +63,15 @@ fn home() -> PathBuf {
     env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+fn plugin_state_dir() -> PathBuf {
+    env::var_os("HERDR_PLUGIN_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| {
+        env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".local/state"))
+            .join(PLUGIN_STATE_SUBDIR)
+    })
+}
+
 fn event_pane() -> Option<String> {
     let raw = env::var("HERDR_PLUGIN_EVENT_JSON").ok()?;
     let event: Value = serde_json::from_str(&raw).ok()?;
@@ -67,19 +80,18 @@ fn event_pane() -> Option<String> {
 
 fn parse_args() -> Result<Option<Config>, String> {
     let session = session_from_socket(env::var("HERDR_SOCKET_PATH").ok().as_deref());
-    let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(FALLBACK_STATE_DIR));
+    let state_dir = plugin_state_dir();
     let mut args = env::args().skip(1);
     let mode = match args.next().as_deref() {
         Some("hook") => Mode::Hook,
         Some("status") => Mode::Status,
+        Some("statusline") => Mode::Statusline,
         Some("-h" | "--help") | None => return Ok(None),
         Some(other) => return Err(format!("comando desconocido: {other}")),
     };
     let mut config = Config {
         mode,
-        meter: home().join(DEFAULT_METER),
+        meter: state_dir.join(METER_FILE),
         state: state_dir.join(format!("{session}.json")),
         threshold: 90.0,
         margin: Duration::minutes(2),
@@ -149,7 +161,28 @@ fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 
 fn read_limits(path: &Path) -> Result<Vec<Limit>, String> {
     let raw = fs::read_to_string(path).map_err(|err| format!("no pude leer {}: {err}", path.display()))?;
-    parse_meter(&raw).map_err(|err| format!("el archivo de sub-meter no tiene el formato esperado: {err}"))
+    parse_meter(&raw).map_err(|err| format!("el archivo de uso no tiene el formato esperado: {err}"))
+}
+
+fn store_fresh_limits(path: &Path, fresh: &[Limit]) -> std::io::Result<Vec<Limit>> {
+    let _lock = lock_state(path)?;
+    let stored = read_limits(path).unwrap_or_default();
+    let merged = merge_limits(&stored, fresh);
+    if merged != stored {
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, meter_json(&merged))?;
+        fs::rename(tmp, path)?;
+    }
+    Ok(merged)
+}
+
+fn statusline(config: &Config) {
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let fresh = limits_from_statusline(&raw).unwrap_or_default();
+    let limits = store_fresh_limits(&config.meter, &fresh)
+        .unwrap_or_else(|_| read_limits(&config.meter).unwrap_or(fresh));
+    println!("{}", render_meter(&limits, Utc::now()));
 }
 
 struct Herdr<'a> {
@@ -447,6 +480,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if config.mode == Mode::Statusline {
+        statusline(&config);
+        return ExitCode::SUCCESS;
+    }
     let herdr = Herdr { bin: &config.herdr, dry_run: config.dry_run };
     match hook(&config, &herdr) {
         Ok(()) => ExitCode::SUCCESS,

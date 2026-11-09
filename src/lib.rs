@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Limit {
     pub kind: String,
@@ -9,13 +9,129 @@ pub struct Limit {
     pub resets_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MeterFile {
     limits: Vec<Limit>,
 }
 
 pub fn parse_meter(raw: &str) -> Result<Vec<Limit>, serde_json::Error> {
     serde_json::from_str::<MeterFile>(raw).map(|file| file.limits)
+}
+
+pub fn meter_json(limits: &[Limit]) -> String {
+    serde_json::to_string_pretty(&MeterFile { limits: limits.to_vec() }).unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusWindow {
+    used_percentage: f64,
+    resets_at: f64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RateLimits {
+    five_hour: Option<StatusWindow>,
+    seven_day: Option<StatusWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusInput {
+    #[serde(default)]
+    rate_limits: Option<RateLimits>,
+}
+
+pub fn limits_from_statusline(raw: &str) -> Result<Vec<Limit>, serde_json::Error> {
+    let input: StatusInput = serde_json::from_str(raw)?;
+    let rate_limits = input.rate_limits.unwrap_or_default();
+    Ok([("five_hour", rate_limits.five_hour), ("seven_day", rate_limits.seven_day)]
+        .into_iter()
+        .filter_map(|(kind, window)| {
+            let window = window?;
+            Some(Limit {
+                kind: kind.into(),
+                percent_used: window.used_percentage,
+                resets_at: DateTime::from_timestamp(window.resets_at as i64, 0)?,
+            })
+        })
+        .collect())
+}
+
+pub fn merge_limits(stored: &[Limit], fresh: &[Limit]) -> Vec<Limit> {
+    let mut merged: Vec<Limit> = stored
+        .iter()
+        .filter(|old| !fresh.iter().any(|new| new.kind == old.kind))
+        .cloned()
+        .collect();
+    for new in fresh {
+        let kept = match stored.iter().find(|old| old.kind == new.kind) {
+            Some(old) if old.resets_at > new.resets_at => old.clone(),
+            Some(old) if old.resets_at == new.resets_at => Limit {
+                percent_used: old.percent_used.max(new.percent_used),
+                ..new.clone()
+            },
+            _ => new.clone(),
+        };
+        merged.push(kept);
+    }
+    merged.sort_by(|a, b| a.kind.cmp(&b.kind));
+    merged
+}
+
+fn short_label(kind: &str) -> &str {
+    match kind {
+        "five_hour" => "5 h",
+        "seven_day" => "sem",
+        other => other,
+    }
+}
+
+fn remaining_text(left: Duration) -> String {
+    let minutes = left.num_minutes().max(0);
+    let (days, hours, mins) = (minutes / 1440, minutes % 1440 / 60, minutes % 60);
+    match (days, hours) {
+        (0, 0) => format!("{mins} min"),
+        (0, _) => format!("{hours} h {mins} min"),
+        _ => format!("{days} d {hours} h"),
+    }
+}
+
+const BAR_CELLS: usize = 8;
+const CLAUDE_ORANGE: &str = "\x1b[38;2;215;119;87m";
+const AMBER: &str = "\x1b[38;2;255;193;7m";
+const RED: &str = "\x1b[38;2;255;107;128m";
+const GRAY: &str = "\x1b[38;2;102;102;102m";
+const RESET: &str = "\x1b[0m";
+
+pub fn render_meter(limits: &[Limit], now: DateTime<Utc>) -> String {
+    let parts: Vec<String> = limits
+        .iter()
+        .filter(|limit| limit.resets_at > now)
+        .map(|limit| {
+            let percent = limit.percent_used.clamp(0.0, 100.0);
+            let filled = ((percent / 100.0) * BAR_CELLS as f64).round() as usize;
+            let color = match percent {
+                p if p >= 90.0 => RED,
+                p if p >= 70.0 => AMBER,
+                _ => CLAUDE_ORANGE,
+            };
+            format!(
+                "{} {}{}{}{}{} {:.0} %{RESET} ↺ {}",
+                short_label(&limit.kind),
+                color,
+                "▰".repeat(filled),
+                GRAY,
+                "▱".repeat(BAR_CELLS - filled),
+                color,
+                percent,
+                remaining_text(limit.resets_at - now)
+            )
+        })
+        .collect();
+    if parts.is_empty() {
+        "uso del plan: sin datos todavía".into()
+    } else {
+        parts.join("  ·  ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_sub_meter_file() {
+    fn parses_meter_file() {
         let raw = r#"{"limits":[{"kind":"five_hour","percentUsed":4,"resetsAt":"2026-11-08T10:10:00.000Z"}]}"#;
         let limits = parse_meter(raw).unwrap();
         assert_eq!(limits[0].kind, "five_hour");
@@ -318,6 +434,49 @@ mod tests {
         );
         assert_eq!(session_from_socket(Some("/x/sessions/a b/herdr.sock")), "default");
         assert_eq!(session_from_socket(None), "default");
+    }
+
+    #[test]
+    fn reads_rate_limits_from_statusline_input() {
+        let raw = r#"{"model":{"id":"x"},"rate_limits":{"five_hour":{"used_percentage":46.2,"resets_at":1794258000},"seven_day":{"used_percentage":3,"resets_at":1794823200}}}"#;
+        let limits = limits_from_statusline(raw).unwrap();
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].kind, "five_hour");
+        assert_eq!(limits[0].percent_used, 46.2);
+        assert_eq!(limits[0].resets_at.timestamp(), 1794258000);
+        assert!(limits_from_statusline(r#"{"model":{}}"#).unwrap().is_empty());
+        assert!(limits_from_statusline(r#"{"rate_limits":null}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_ignores_stale_sessions_and_keeps_missing_windows() {
+        let stored = [limit("five_hour", 60.0, 10), limit("seven_day", 20.0, 20)];
+        let older_window = [limit("five_hour", 99.0, 5)];
+        assert_eq!(merge_limits(&stored, &older_window), stored);
+        let same_window_lower = [limit("five_hour", 40.0, 10)];
+        assert_eq!(merge_limits(&stored, &same_window_lower)[0].percent_used, 60.0);
+        let new_window = [limit("five_hour", 2.0, 15)];
+        let merged = merge_limits(&stored, &new_window);
+        assert_eq!(merged[0], limit("five_hour", 2.0, 15));
+        assert_eq!(merged[1], limit("seven_day", 20.0, 20));
+    }
+
+    #[test]
+    fn meter_round_trips_through_the_file_format() {
+        let limits = vec![limit("five_hour", 46.0, 10)];
+        assert_eq!(parse_meter(&meter_json(&limits)).unwrap(), limits);
+    }
+
+    #[test]
+    fn renders_live_windows_only() {
+        let limits = [limit("five_hour", 50.0, 10), limit("seven_day", 95.0, 7)];
+        let line = render_meter(&limits, at(8));
+        assert!(line.starts_with("5 h "));
+        assert!(line.contains("▰▰▰▰\x1b[38;2;102;102;102m▱▱▱▱"));
+        assert!(line.contains("50 %"));
+        assert!(line.contains("↺ 2 h 0 min"));
+        assert!(!line.contains("sem"));
+        assert_eq!(render_meter(&[], at(8)), "uso del plan: sin datos todavía");
     }
 
     #[test]
