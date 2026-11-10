@@ -216,7 +216,8 @@ fn statusline(config: &Config) {
     let fresh = limits_from_statusline(&raw).unwrap_or_default();
     let limits = store_fresh_limits(&config.meter, &fresh)
         .unwrap_or_else(|_| read_limits(&config.meter).unwrap_or(fresh));
-    println!("{}", render_meter(&limits, Utc::now()));
+    let columns = std::env::var("COLUMNS").ok().and_then(|value| value.parse().ok());
+    println!("{}", render_meter(&limits, Utc::now(), columns));
 }
 
 struct Herdr<'a> {

@@ -13,8 +13,10 @@ El plugin reúne cuatro funciones:
 1. **Barra de uso.** `herdr-usage statusline` recibe por stdin los `rate_limits` que Claude Code entrega a su statusline. Guarda la lectura en un archivo y muestra dos barras, una para la ventana de cinco horas y otra para la semanal, con el porcentaje usado y el tiempo restante hasta el reinicio. Usa el naranja de Claude hasta el 69 %, ámbar desde el 70 % y rojo desde el 90 %. Sin colores, se ve así:
 
    ```text
-   5 h ▰▱▱▱▱▱▱▱ 11 % ↺ 1 h 1 min  ·  sem ▱▱▱▱▱▱▱▱ 5 % ↺ 6 d 7 h
+   5 h ▰▱▱▱▱▱▱▱ 11 % (reinicia en 1 h 1 min)  ·  sem ▱▱▱▱▱▱▱▱ 5 % (reinicia en 6 d 7 h)
    ```
+
+   Las barras se ajustan al ancho de la terminal que Claude Code entrega en `COLUMNS`: miden de 6 a 30 celdas cada una y dejan 10 columnas libres para los avisos de Claude Code. En una terminal angosta, el texto se acorta a `(1 h 1 min)`; además, la barra cambia de tamaño en el siguiente redibujado, no al momento de redimensionar la ventana.
 
 2. **Cierre ordenado.** Al llegar una ventana al 90 %, pide a los panes de Claude que están trabajando, además del que acaba de terminar su turno, que hagan commit y push de su rama. También les pide una nota breve sobre dónde se quedaron y qué sigue. Envía esa petición una sola vez por ventana.
 

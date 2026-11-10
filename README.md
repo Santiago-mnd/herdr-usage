@@ -15,8 +15,10 @@ The plugin has four parts:
    Without colors, a reading looks like this:
 
    ```text
-   5 h ▰▱▱▱▱▱▱▱ 11 % ↺ 1 h 1 min  ·  sem ▱▱▱▱▱▱▱▱ 5 % ↺ 6 d 7 h
+   5 h ▰▱▱▱▱▱▱▱ 11 % (reinicia en 1 h 1 min)  ·  sem ▱▱▱▱▱▱▱▱ 5 % (reinicia en 6 d 7 h)
    ```
+
+   The bars stretch to fit the terminal width that Claude Code passes in `COLUMNS`, from 6 to 30 cells each, leaving 10 columns free for Claude Code's own notices. On a narrow terminal the text shortens to `(1 h 1 min)`. The bar resizes on the next redraw, not when you resize the window.
 
    The bar labels and agent messages are in Spanish; `sem` means *weekly*.
 

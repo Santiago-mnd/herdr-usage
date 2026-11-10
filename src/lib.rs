@@ -96,43 +96,94 @@ fn remaining_text(left: Duration) -> String {
     }
 }
 
-const BAR_CELLS: usize = 8;
+const DEFAULT_CELLS: usize = 8;
+const MIN_CELLS: usize = 6;
+const MAX_CELLS: usize = 30;
+const RESERVED_COLUMNS: usize = 10;
+const SEPARATOR: &str = "  ·  ";
 const CLAUDE_ORANGE: &str = "\x1b[38;2;215;119;87m";
 const AMBER: &str = "\x1b[38;2;255;193;7m";
 const RED: &str = "\x1b[38;2;255;107;128m";
 const GRAY: &str = "\x1b[38;2;102;102;102m";
 const RESET: &str = "\x1b[0m";
 
-pub fn render_meter(limits: &[Limit], now: DateTime<Utc>) -> String {
-    let parts: Vec<String> = limits
+struct MeterPart {
+    label: String,
+    percent: f64,
+    remaining: String,
+}
+
+impl MeterPart {
+    fn suffix(&self, long: bool) -> String {
+        if long {
+            format!("(reinicia en {})", self.remaining)
+        } else {
+            format!("({})", self.remaining)
+        }
+    }
+
+    fn text_width(&self, long: bool) -> usize {
+        let percent = format!("{:.0} %", self.percent);
+        self.label.chars().count() + percent.chars().count() + self.suffix(long).chars().count() + 3
+    }
+
+    fn render(&self, cells: usize, long: bool) -> String {
+        let filled = ((self.percent / 100.0) * cells as f64).round() as usize;
+        let color = match self.percent {
+            p if p >= 90.0 => RED,
+            p if p >= 70.0 => AMBER,
+            _ => CLAUDE_ORANGE,
+        };
+        format!(
+            "{} {}{}{}{}{} {:.0} %{RESET} {}",
+            self.label,
+            color,
+            "▰".repeat(filled),
+            GRAY,
+            "▱".repeat(cells - filled),
+            color,
+            self.percent,
+            self.suffix(long)
+        )
+    }
+}
+
+fn layout(parts: &[MeterPart], columns: Option<usize>) -> (usize, bool) {
+    let Some(columns) = columns else {
+        return (DEFAULT_CELLS, true);
+    };
+    let available = columns.saturating_sub(RESERVED_COLUMNS);
+    let separators = SEPARATOR.chars().count() * (parts.len() - 1);
+    let cells_for = |long: bool| {
+        let text: usize = parts.iter().map(|part| part.text_width(long)).sum();
+        available.saturating_sub(text + separators) / parts.len()
+    };
+    let long_cells = cells_for(true);
+    if long_cells >= MIN_CELLS {
+        return (long_cells.min(MAX_CELLS), true);
+    }
+    (cells_for(false).clamp(MIN_CELLS, MAX_CELLS), false)
+}
+
+pub fn render_meter(limits: &[Limit], now: DateTime<Utc>, columns: Option<usize>) -> String {
+    let parts: Vec<MeterPart> = limits
         .iter()
         .filter(|limit| limit.resets_at > now)
-        .map(|limit| {
-            let percent = limit.percent_used.clamp(0.0, 100.0);
-            let filled = ((percent / 100.0) * BAR_CELLS as f64).round() as usize;
-            let color = match percent {
-                p if p >= 90.0 => RED,
-                p if p >= 70.0 => AMBER,
-                _ => CLAUDE_ORANGE,
-            };
-            format!(
-                "{} {}{}{}{}{} {:.0} %{RESET} ↺ {}",
-                short_label(&limit.kind),
-                color,
-                "▰".repeat(filled),
-                GRAY,
-                "▱".repeat(BAR_CELLS - filled),
-                color,
-                percent,
-                remaining_text(limit.resets_at - now)
-            )
+        .map(|limit| MeterPart {
+            label: short_label(&limit.kind).to_string(),
+            percent: limit.percent_used.clamp(0.0, 100.0),
+            remaining: remaining_text(limit.resets_at - now),
         })
         .collect();
     if parts.is_empty() {
-        "uso del plan: sin datos todavía".into()
-    } else {
-        parts.join("  ·  ")
+        return "uso del plan: sin datos todavía".into();
     }
+    let (cells, long) = layout(&parts, columns);
+    parts
+        .iter()
+        .map(|part| part.render(cells, long))
+        .collect::<Vec<_>>()
+        .join(SEPARATOR)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -495,13 +546,50 @@ mod tests {
     #[test]
     fn renders_live_windows_only() {
         let limits = [limit("five_hour", 50.0, 10), limit("seven_day", 95.0, 7)];
-        let line = render_meter(&limits, at(8));
+        let line = render_meter(&limits, at(8), None);
         assert!(line.starts_with("5 h "));
         assert!(line.contains("▰▰▰▰\x1b[38;2;102;102;102m▱▱▱▱"));
         assert!(line.contains("50 %"));
-        assert!(line.contains("↺ 2 h 0 min"));
+        assert!(line.contains("(reinicia en 2 h 0 min)"));
         assert!(!line.contains("sem"));
-        assert_eq!(render_meter(&[], at(8)), "uso del plan: sin datos todavía");
+        assert_eq!(render_meter(&[], at(8), None), "uso del plan: sin datos todavía");
+    }
+
+    fn visible_width(line: &str) -> usize {
+        let mut width = 0;
+        let mut in_escape = false;
+        for c in line.chars() {
+            match (in_escape, c) {
+                (false, '\x1b') => in_escape = true,
+                (true, 'm') => in_escape = false,
+                (true, _) => {}
+                (false, _) => width += 1,
+            }
+        }
+        width
+    }
+
+    fn cells(line: &str) -> usize {
+        line.chars().filter(|c| *c == '▰' || *c == '▱').count()
+    }
+
+    #[test]
+    fn meter_fits_the_terminal_width() {
+        let limits = [limit("five_hour", 50.0, 10), limit("seven_day", 20.0, 20)];
+        for columns in [70, 80, 100, 120, 160] {
+            let line = render_meter(&limits, at(8), Some(columns));
+            assert!(visible_width(&line) <= columns - 10, "{columns}: {line}");
+        }
+        let wide = render_meter(&limits, at(8), Some(400));
+        assert_eq!(cells(&wide), 60);
+        assert!(wide.contains("reinicia en"));
+        let medium = render_meter(&limits, at(8), Some(120));
+        assert!(cells(&medium) > 16);
+        assert!(medium.contains("reinicia en"));
+        let narrow = render_meter(&limits, at(8), Some(70));
+        assert!(!narrow.contains("reinicia en"));
+        assert!(narrow.contains("(2 h 0 min)"));
+        assert!(cells(&narrow) >= 12);
     }
 
     #[test]
