@@ -7,5 +7,7 @@
 - Compilar con prioridad baja en el VPS: `nice -n 10 cargo build --release -j 2`.
 - Pruebas: `cargo test`. Para probar en vivo, `hook --dry-run` o `statusline` con `--meter` apuntando a una copia y `HERDR_PLUGIN_STATE_DIR` a una carpeta temporal; nunca se edita a mano el archivo real de uso (`~/.local/state/herdr/plugins/herdr-usage/meter/claude.json`).
 - sub-meter se desinstaló el 9-nov-2026; la statusline propia lo reemplaza.
+- Cada ejecución lanzada por herdr (con `HERDR_PLUGIN_ID`) mantiene el enlace `~/.local/bin/herdr-usage` hacia el binario de la instalación actual, para que la `statusLine` de Claude Code no dependa de la carpeta que herdr cambia en cada `update`.
+- Documentación pública: `README.md` (inglés) y `README.es.md` (español), con los mismos hechos; `docs/agents.md` es para los agentes que reciben los mensajes `[herdr-usage]`. Se redactan con la skill `writing` y se actualizan juntos.
 - Nada se deja corriendo sin el visto bueno del owner (regla de procesos). El único proceso programado es el timer de regreso de una sola vez; el README dice cómo verlo y cancelarlo.
 - Decisiones e historia: engram, `idea/herdr-usage-alerts` (proyecto knowledge-vault), y Linear SG-200.

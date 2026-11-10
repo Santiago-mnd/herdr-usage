@@ -6,14 +6,16 @@ use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Duration, Local, Utc};
 use herdr_usage::{
-    Action, Agent, Limit, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, limits_from_statusline,
-    merge_limits, meter_json, parse_meter, render_meter, session_from_socket, timer_needed, wrap_up_prompt,
+    Action, Agent, Limit, LinkAction, LinkState, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, limits_from_statusline,
+    merge_limits, meter_json, parse_meter, render_meter, session_from_socket, stable_link_action, timer_needed,
+    wrap_up_prompt,
     wrap_up_targets,
 };
 use serde_json::Value;
 
 const PLUGIN_STATE_SUBDIR: &str = "herdr/plugins/herdr-usage";
 const METER_FILE: &str = "meter/claude.json";
+const STABLE_LINK: &str = ".local/bin/herdr-usage";
 const TIMER_ENV: [&str; 4] = [
     "HERDR_BIN_PATH",
     "HERDR_SOCKET_PATH",
@@ -176,13 +178,46 @@ fn store_fresh_limits(path: &Path, fresh: &[Limit]) -> std::io::Result<Vec<Limit
     Ok(merged)
 }
 
+fn ensure_stable_link(config: &Config) {
+    if config.dry_run || env::var_os("HERDR_PLUGIN_ID").is_none() {
+        return;
+    }
+    let Ok(exe) = env::current_exe().and_then(fs::canonicalize) else {
+        return;
+    };
+    let link = home().join(STABLE_LINK);
+    let target = fs::read_link(&link).ok();
+    let current = match (fs::symlink_metadata(&link), target.as_deref()) {
+        (Err(_), _) => LinkState::Missing,
+        (Ok(_), Some(target)) => LinkState::Symlink(target),
+        (Ok(_), None) => LinkState::OtherFile,
+    };
+    let result = match stable_link_action(current, &exe) {
+        LinkAction::Keep => return,
+        LinkAction::Blocked => {
+            log(&format!("{} ya existe y no es un enlace; no lo toco", link.display()));
+            return;
+        }
+        LinkAction::Replace => fs::remove_file(&link).and_then(|_| std::os::unix::fs::symlink(&exe, &link)),
+        LinkAction::Create => link
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|_| std::os::unix::fs::symlink(&exe, &link)),
+    };
+    match result {
+        Ok(()) => log(&format!("enlace {} → {}", link.display(), exe.display())),
+        Err(err) => log(&format!("no pude crear el enlace {}: {err}", link.display())),
+    }
+}
+
 fn statusline(config: &Config) {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let fresh = limits_from_statusline(&raw).unwrap_or_default();
     let limits = store_fresh_limits(&config.meter, &fresh)
         .unwrap_or_else(|_| read_limits(&config.meter).unwrap_or(fresh));
-    println!("{}", render_meter(&limits, Utc::now()));
+    let columns = std::env::var("COLUMNS").ok().and_then(|value| value.parse().ok());
+    println!("{}", render_meter(&limits, Utc::now(), columns));
 }
 
 struct Herdr<'a> {
@@ -484,6 +519,7 @@ fn main() -> ExitCode {
         statusline(&config);
         return ExitCode::SUCCESS;
     }
+    ensure_stable_link(&config);
     let herdr = Herdr { bin: &config.herdr, dry_run: config.dry_run };
     match hook(&config, &herdr) {
         Ok(()) => ExitCode::SUCCESS,
