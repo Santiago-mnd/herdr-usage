@@ -38,7 +38,7 @@ The plugin makes no network calls or requests to external services. Its usage da
 
 - Linux with systemd user services (`systemctl --user`). macOS is not supported yet.
 - herdr 0.9.5 or newer.
-- Rust and `cargo`. herdr builds the plugin locally with `cargo build --release --locked` during installation.
+- Rust and `cargo`. herdr builds the plugin locally with `cargo build --release --locked` during installation, so `cargo` must be on the `PATH` of the shell where you run `herdr plugin install`. A standard rustup install adds `~/.cargo/bin` to it.
 - Claude Code.
 - `~/.local/bin` on your `PATH`, or the full path to the link in your statusline command.
 
