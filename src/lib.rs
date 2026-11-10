@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +201,30 @@ pub fn session_from_socket(socket: Option<&str>) -> String {
         .filter(|name| valid_session_name(name))
         .unwrap_or("default")
         .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkState<'a> {
+    Missing,
+    Symlink(&'a Path),
+    OtherFile,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkAction {
+    Keep,
+    Create,
+    Replace,
+    Blocked,
+}
+
+pub fn stable_link_action(current: LinkState, exe: &Path) -> LinkAction {
+    match current {
+        LinkState::Missing => LinkAction::Create,
+        LinkState::Symlink(target) if target == exe => LinkAction::Keep,
+        LinkState::Symlink(_) => LinkAction::Replace,
+        LinkState::OtherFile => LinkAction::Blocked,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -477,6 +502,16 @@ mod tests {
         assert!(line.contains("↺ 2 h 0 min"));
         assert!(!line.contains("sem"));
         assert_eq!(render_meter(&[], at(8)), "uso del plan: sin datos todavía");
+    }
+
+    #[test]
+    fn stable_link_follows_the_current_install() {
+        let exe = Path::new("/plugins/herdr-usage/b/target/release/herdr-usage");
+        let old = Path::new("/plugins/herdr-usage/a/target/release/herdr-usage");
+        assert_eq!(stable_link_action(LinkState::Missing, exe), LinkAction::Create);
+        assert_eq!(stable_link_action(LinkState::Symlink(exe), exe), LinkAction::Keep);
+        assert_eq!(stable_link_action(LinkState::Symlink(old), exe), LinkAction::Replace);
+        assert_eq!(stable_link_action(LinkState::OtherFile, exe), LinkAction::Blocked);
     }
 
     #[test]
