@@ -32,7 +32,7 @@ herdr ejecuta `herdr-usage hook` al arrancar y ante cada evento `pane.agent_stat
 
 - Linux con systemd de usuario (`systemctl --user`); macOS todavía no está disponible.
 - herdr 0.9.5 o posterior.
-- Rust con `cargo`. herdr compila el plugin en tu máquina durante la instalación con `cargo build --release --locked`.
+- Rust con `cargo`. herdr compila el plugin en tu máquina durante la instalación con `cargo build --release --locked`; por eso `cargo` tiene que estar en el `PATH` de la terminal donde corres `herdr plugin install`. Una instalación normal con rustup agrega `~/.cargo/bin` al `PATH`.
 - Claude Code.
 - `~/.local/bin` en el `PATH`. Si no está, usa la ruta completa del enlace en la configuración de la statusline.
 
