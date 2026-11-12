@@ -6,10 +6,9 @@ use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Duration, Local, Utc};
 use herdr_usage::{
-    Action, Agent, Limit, LinkAction, LinkState, PaneRef, RESUME_PROMPT, State, Wrap, evaluate, kind_label, limits_from_statusline,
-    merge_limits, meter_json, parse_meter, render_meter, session_from_socket, stable_link_action, timer_needed,
-    wrap_up_prompt,
-    wrap_up_targets,
+    Action, Agent, Limit, LinkAction, LinkState, PaneRef, RESUME_PROMPT, Readiness, State, Wrap, catch_up_targets, evaluate,
+    in_wrap_window, kind_label, limits_from_statusline, merge_limits, meter_json, parse_meter, readiness, render_meter,
+    retry_resume, session_from_socket, stable_link_action, timer_needed, wrap_up_prompt, wrap_up_targets,
 };
 use serde_json::Value;
 
@@ -263,14 +262,16 @@ impl Herdr<'_> {
             .collect())
     }
 
-    fn ready_for_resume(&self, pane: &PaneRef) -> bool {
+    fn readiness(&self, pane: &PaneRef) -> Readiness {
         let Ok(info) = self.query(&["agent", "get", &pane.pane_id]) else {
-            return false;
+            return Readiness::Unknown;
         };
         let agent = &info["result"]["agent"];
-        let same_session = pane.session.as_deref() == agent["agent_session"]["value"].as_str();
-        let status = agent["agent_status"].as_str().unwrap_or_default();
-        same_session && matches!(status, "idle" | "done")
+        readiness(
+            pane,
+            agent["agent_session"]["value"].as_str(),
+            agent["agent_status"].as_str().unwrap_or_default(),
+        )
     }
 
     fn prompt(&self, pane: &str, text: &str) -> Result<(), String> {
@@ -304,22 +305,19 @@ fn when_text(moment: DateTime<Utc>) -> String {
 
 fn wrap_up(config: &Config, herdr: &Herdr, limits: &[Limit], kinds: Vec<String>, resume_at: DateTime<Utc>) -> Wrap {
     let text = wrap_up_prompt(limits, &kinds);
-    let agents = herdr.agents().unwrap_or_else(|err| {
-        log(&format!("no pude listar los agentes: {err}"));
-        Vec::new()
-    });
-    let mut reached = Vec::new();
-    let targets = wrap_up_targets(&agents, config.event_pane.as_deref())
-        .into_iter()
-        .filter(|pane| config.only_pane.as_ref().is_none_or(|only| &pane.pane_id == only));
-    for pane in targets {
-        match herdr.prompt(&pane.pane_id, &text) {
-            Ok(()) => reached.push(pane),
-            Err(err) => log(&format!("no pude avisar a {}: {err}", pane.pane_id)),
+    let listed = herdr.agents();
+    let targets = match &listed {
+        Ok(agents) => wrap_up_targets(agents, config.event_pane.as_deref()),
+        Err(err) => {
+            log(&format!("no pude listar los agentes: {err}"));
+            Vec::new()
         }
-    }
+    };
+    let reached = deliver(config, herdr, targets, &text);
     let when = when_text(resume_at);
-    let body = if reached.is_empty() {
+    let body = if listed.is_err() {
+        format!("No pude ver los panes; reintento en el siguiente evento. Se reinicia a las {when}.")
+    } else if reached.is_empty() {
         format!("Ningún pane estaba trabajando. Se reinicia a las {when}.")
     } else {
         format!(
@@ -330,29 +328,75 @@ fn wrap_up(config: &Config, herdr: &Herdr, limits: &[Limit], kinds: Vec<String>,
     };
     herdr.notify(&format!("Uso {} cerca del límite", kinds_text(&kinds)), &body);
     log(&body);
-    Wrap { resume_at, kinds, panes: reached }
+    Wrap { resume_at, kinds, panes: reached, attempts: 0 }
 }
 
-fn resume(herdr: &Herdr, wrap: &Wrap) {
-    let resumed = wrap
-        .panes
-        .iter()
-        .filter(|pane| herdr.ready_for_resume(pane))
-        .filter(|pane| match herdr.prompt(&pane.pane_id, RESUME_PROMPT) {
+fn deliver(config: &Config, herdr: &Herdr, targets: Vec<PaneRef>, text: &str) -> Vec<PaneRef> {
+    targets
+        .into_iter()
+        .filter(|pane| config.only_pane.as_ref().is_none_or(|only| &pane.pane_id == only))
+        .filter(|pane| match herdr.prompt(&pane.pane_id, text) {
             Ok(()) => true,
             Err(err) => {
-                log(&format!("no pude retomar {}: {err}", pane.pane_id));
+                log(&format!("no pude avisar a {}: {err}", pane.pane_id));
                 false
             }
         })
-        .count();
-    let body = if wrap.panes.is_empty() {
+        .collect()
+}
+
+fn catch_up(config: &Config, herdr: &Herdr, limits: &[Limit], wrap: &mut Wrap) {
+    let agents = match herdr.agents() {
+        Ok(agents) => agents,
+        Err(err) => {
+            log(&format!("no pude listar los agentes: {err}"));
+            return;
+        }
+    };
+    let targets = catch_up_targets(&agents, config.event_pane.as_deref(), wrap);
+    if targets.is_empty() {
+        return;
+    }
+    let reached = deliver(config, herdr, targets, &wrap_up_prompt(limits, &wrap.kinds));
+    if !reached.is_empty() {
+        log(&format!("pedí cierre ordenado a {} pane{} más", reached.len(), plural(reached.len())));
+        wrap.panes.extend(reached);
+    }
+}
+
+fn resume(herdr: &Herdr, wrap: &Wrap) -> Option<Wrap> {
+    let mut resumed = 0;
+    let mut failed = Vec::new();
+    for pane in &wrap.panes {
+        match herdr.readiness(pane) {
+            Readiness::Skip => {}
+            Readiness::Unknown => failed.push(pane.clone()),
+            Readiness::Ready => match herdr.prompt(&pane.pane_id, RESUME_PROMPT) {
+                Ok(()) => resumed += 1,
+                Err(err) => {
+                    log(&format!("no pude retomar {}: {err}", pane.pane_id));
+                    failed.push(pane.clone());
+                }
+            },
+        }
+    }
+    let retry = retry_resume(wrap, failed, Utc::now());
+    let total = wrap.panes.len();
+    let mut body = if total == 0 {
         "No había panes por retomar.".to_string()
     } else {
-        format!("Retomé {resumed} de {} pane{}.", wrap.panes.len(), plural(wrap.panes.len()))
+        format!("Retomé {resumed} de {total} pane{}.", plural(total))
     };
-    herdr.notify(&format!("Se reinició el uso {}", kinds_text(&wrap.kinds)), &body);
+    if let Some(next) = &retry {
+        body.push_str(&format!(" Reintento a las {}.", when_text(next.resume_at)));
+    }
+    let first = wrap.attempts == 0;
+    if first || retry.is_none() {
+        let title = if first { "Se reinició el uso" } else { "Reintento de regreso, uso" };
+        herdr.notify(&format!("{title} {}", kinds_text(&wrap.kinds)), &body);
+    }
     log(&body);
+    retry
 }
 
 fn timer_unit(session: &str, at: DateTime<Utc>) -> String {
@@ -475,7 +519,13 @@ fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
     }
     let mut state = before.clone();
     match action {
-        Action::Nothing => {}
+        Action::Nothing => {
+            if in_wrap_window(&state, Utc::now())
+                && let Some(wrap) = state.wrap.as_mut()
+            {
+                catch_up(config, herdr, &limits, wrap);
+            }
+        }
         Action::WrapUp { resume_at, kinds } => {
             state.wrap = Some(wrap_up(config, herdr, &limits, kinds, resume_at));
         }
@@ -488,7 +538,7 @@ fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
         }
         Action::Resume => {
             if let Some(wrap) = state.wrap.take() {
-                resume(herdr, &wrap);
+                state.wrap = resume(herdr, &wrap);
             }
         }
     }
