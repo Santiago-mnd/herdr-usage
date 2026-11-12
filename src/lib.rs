@@ -197,6 +197,12 @@ pub struct Wrap {
     pub resume_at: DateTime<Utc>,
     pub kinds: Vec<String>,
     pub panes: Vec<PaneRef>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attempts: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -228,6 +234,50 @@ pub fn wrap_up_targets(agents: &[Agent], event_pane: Option<&str>) -> Vec<PaneRe
             session: agent.session.clone(),
         })
         .collect()
+}
+
+pub fn catch_up_targets(agents: &[Agent], event_pane: Option<&str>, wrap: &Wrap) -> Vec<PaneRef> {
+    wrap_up_targets(agents, event_pane)
+        .into_iter()
+        .filter(|pane| wrap.panes.iter().all(|asked| asked.pane_id != pane.pane_id))
+        .collect()
+}
+
+pub fn in_wrap_window(state: &State, now: DateTime<Utc>) -> bool {
+    state
+        .wrap
+        .as_ref()
+        .is_some_and(|wrap| wrap.attempts == 0 && now < wrap.resume_at)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Readiness {
+    Ready,
+    Skip,
+    Unknown,
+}
+
+pub fn readiness(pane: &PaneRef, session: Option<&str>, status: &str) -> Readiness {
+    if pane.session.as_deref() != session {
+        Readiness::Skip
+    } else if matches!(status, "idle" | "done") {
+        Readiness::Ready
+    } else {
+        Readiness::Skip
+    }
+}
+
+pub const RESUME_RETRY_MINUTES: i64 = 5;
+pub const RESUME_ATTEMPTS: u32 = 3;
+
+pub fn retry_resume(wrap: &Wrap, failed: Vec<PaneRef>, now: DateTime<Utc>) -> Option<Wrap> {
+    let attempts = wrap.attempts + 1;
+    (!failed.is_empty() && attempts < RESUME_ATTEMPTS).then(|| Wrap {
+        resume_at: now + Duration::minutes(RESUME_RETRY_MINUTES),
+        kinds: wrap.kinds.clone(),
+        panes: failed,
+        attempts,
+    })
 }
 
 pub fn timer_needed(state: &State) -> Option<DateTime<Utc>> {
@@ -404,6 +454,7 @@ mod tests {
                 resume_at,
                 kinds: vec!["five_hour".into()],
                 panes: vec![],
+                attempts: 0,
             }),
             timer_for: None,
         };
@@ -427,6 +478,7 @@ mod tests {
                     pane_id: "w1:p1".into(),
                     session: None,
                 }],
+                attempts: 0,
             }),
             timer_for: None,
         };
@@ -441,6 +493,7 @@ mod tests {
                 resume_at: at(10),
                 kinds: vec!["five_hour".into()],
                 panes: vec![],
+                attempts: 0,
             }),
             timer_for: None,
         };
@@ -484,6 +537,7 @@ mod tests {
             resume_at: at(10),
             kinds: vec!["five_hour".into()],
             panes: vec![],
+            attempts: 0,
         };
         let mut state = State {
             wrap: Some(wrap),
@@ -607,5 +661,78 @@ mod tests {
         let limits = [limit("five_hour", 91.4, 10)];
         let prompt = wrap_up_prompt(&limits, &["five_hour".into()]);
         assert!(prompt.contains("de 5 h al 91 %"));
+    }
+
+    fn wrap_with(panes: &[&str], attempts: u32) -> Wrap {
+        Wrap {
+            resume_at: at(10),
+            kinds: vec!["five_hour".into()],
+            panes: panes
+                .iter()
+                .map(|pane| PaneRef {
+                    pane_id: (*pane).into(),
+                    session: Some(format!("s-{pane}")),
+                })
+                .collect(),
+            attempts,
+        }
+    }
+
+    #[test]
+    fn catch_up_reaches_working_panes_not_asked_yet() {
+        let agents = [
+            agent("w1:p1", "claude", "working"),
+            agent("w1:p2", "claude", "working"),
+            agent("w1:p3", "claude", "idle"),
+        ];
+        let targets: Vec<String> = catch_up_targets(&agents, None, &wrap_with(&["w1:p1"], 0))
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        assert_eq!(targets, ["w1:p2"]);
+    }
+
+    #[test]
+    fn catch_up_only_runs_before_the_first_resume() {
+        let state = |attempts| State {
+            wrap: Some(wrap_with(&[], attempts)),
+            timer_for: None,
+        };
+        assert!(in_wrap_window(&state(0), at(9)));
+        assert!(!in_wrap_window(&state(0), at(10)));
+        assert!(!in_wrap_window(&state(1), at(9)));
+        assert!(!in_wrap_window(&State::default(), at(9)));
+    }
+
+    #[test]
+    fn resume_needs_the_same_session_at_rest() {
+        let pane = PaneRef {
+            pane_id: "w1:p1".into(),
+            session: Some("a".into()),
+        };
+        assert_eq!(readiness(&pane, Some("a"), "idle"), Readiness::Ready);
+        assert_eq!(readiness(&pane, Some("a"), "done"), Readiness::Ready);
+        assert_eq!(readiness(&pane, Some("a"), "working"), Readiness::Skip);
+        assert_eq!(readiness(&pane, Some("b"), "idle"), Readiness::Skip);
+    }
+
+    #[test]
+    fn failed_resume_retries_a_bounded_number_of_times() {
+        let failed = || wrap_with(&["w1:p2"], 0).panes;
+        let first = retry_resume(&wrap_with(&["w1:p1", "w1:p2"], 0), failed(), at(10)).unwrap();
+        assert_eq!(first.resume_at, at(10) + Duration::minutes(RESUME_RETRY_MINUTES));
+        assert_eq!(first.panes, failed());
+        assert_eq!(first.attempts, 1);
+        let second = retry_resume(&first, failed(), at(11)).unwrap();
+        assert_eq!(second.attempts, 2);
+        assert_eq!(retry_resume(&second, failed(), at(12)), None);
+        assert_eq!(retry_resume(&first, vec![], at(11)), None);
+    }
+
+    #[test]
+    fn old_state_files_without_attempts_still_load() {
+        let raw = r#"{"wrap":{"resume_at":"2026-11-08T10:00:00Z","kinds":["five_hour"],"panes":[]}}"#;
+        let state: State = serde_json::from_str(raw).unwrap();
+        assert_eq!(state.wrap.unwrap().attempts, 0);
     }
 }
