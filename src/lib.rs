@@ -1,3 +1,5 @@
+pub mod schedule;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

@@ -18,7 +18,7 @@ El plugin reúne cuatro funciones:
 
    Las barras se ajustan al ancho de la terminal que Claude Code entrega en `COLUMNS`: miden de 6 a 30 celdas cada una y dejan 10 columnas libres para los avisos de Claude Code. En una terminal angosta, el texto se acorta a `(1 h 1 min)`; además, la barra cambia de tamaño en el siguiente redibujado, no al momento de redimensionar la ventana.
 
-2. **Cierre ordenado.** Al llegar una ventana al 90 %, pide a los panes de Claude que están trabajando, además del que acaba de terminar su turno, que hagan commit y push de su rama. También les pide una nota breve sobre dónde se quedaron y qué sigue. Envía esa petición una sola vez por ventana.
+2. **Cierre ordenado.** Al llegar una ventana al 90 %, pide a los panes de Claude que están trabajando, además del que acaba de terminar su turno, que hagan commit y push de su rama. También les pide una nota breve sobre dónde se quedaron y qué sigue. Envía esa petición una sola vez por ventana. Si falla la lista de agentes o el envío a un pane, vuelve a pedirle el cierre en el siguiente evento antes del reinicio; también alcanza a los panes que empiezan a trabajar después de la primera petición.
 
 3. **Regreso.** Dos minutos después de la hora de reinicio, envía «retoma» a esos mismos panes, siempre que conserven la misma sesión de agente y estén en reposo (`idle` o `done`).
 
@@ -26,15 +26,15 @@ El plugin reúne cuatro funciones:
 
 Los mensajes dirigidos a los agentes están en español y comienzan con `[herdr-usage]`. El plugin no hace llamadas de red ni consulta servicios externos: obtiene el uso del JSON que Claude Code ya entrega a la statusline. Si varias sesiones escriben una lectura al mismo tiempo, conserva la ventana más reciente; dentro de una misma ventana, conserva el porcentaje más alto.
 
-herdr ejecuta `herdr-usage hook` al arrancar y ante cada evento `pane.agent_status_changed`. El proceso lee el archivo de uso, toma una decisión y sale en unos 14 ms; no queda un daemon activo. Para el regreso crea un único timer de systemd de usuario, de una sola vez, llamado `herdr-usage-resume-<sesión>-<hora>`; el timer se borra solo. Cada sesión de herdr mantiene su propio estado.
+herdr ejecuta `herdr-usage hook` al arrancar y ante cada evento `pane.agent_status_changed`. El proceso lee el archivo de uso, toma una decisión y sale en unos 14 ms; no queda un daemon activo. Para un regreso pendiente crea una tarea de una sola vez con el programador del sistema: un timer de systemd de usuario en Linux, un LaunchAgent en macOS o una tarea del Programador de tareas en Windows. Todas se llaman `herdr-usage-resume-<sesión>-<hora>`; el timer de Linux se borra solo después de correr. En macOS, el LaunchAgent se guarda en `~/Library/LaunchAgents/dev.herdr-usage.herdr-usage-resume-<sesión>-<hora>.plist`: launchd lo ejecuta a la hora redondeada al minuto siguiente y la propia ejecución borra el archivo y lo descarga. En Windows, la tarea vive en `\herdr-usage\`: al correr intenta borrarse y, si permanece, vence una hora después de la hora programada. Si la tarea no corre, el siguiente evento de herdr después del reinicio hace el regreso; si falla el envío de «retoma» o herdr no responde, lo reintenta a los cinco minutos, hasta tres intentos en total. Cada sesión de herdr mantiene su propio estado.
 
 ## Requisitos
 
-- Linux con systemd de usuario (`systemctl --user`); macOS todavía no está disponible.
+- Linux, macOS o Windows. El manifest declara las tres plataformas.
 - herdr 0.9.5 o posterior.
-- Rust con `cargo`. herdr compila el plugin en tu máquina durante la instalación con `cargo build --release --locked`; por eso `cargo` tiene que estar en el `PATH` de la terminal donde corres `herdr plugin install`. Una instalación normal con rustup agrega `~/.cargo/bin` al `PATH`.
+- Rust con `cargo`. herdr compila el plugin en tu máquina durante la instalación con `cargo build --release --locked`; por eso `cargo` tiene que estar en el `PATH` de la terminal donde corres `herdr plugin install`. Una instalación normal con rustup agrega `~/.cargo/bin` al `PATH`. En Windows, la cadena predeterminada de Rust (MSVC) requiere Visual Studio Build Tools con C++; la cadena GNU falló al compilar por falta de `dlltool`.
 - Claude Code.
-- `~/.local/bin` en el `PATH`. Si no está, usa la ruta completa del enlace en la configuración de la statusline.
+- En Linux y macOS, `~/.local/bin` en el `PATH`. Si no está, usa la ruta completa del enlace en la configuración de la statusline. En Windows, la statusline debe apuntar a la ruta completa de `target\release\herdr-usage.exe` dentro de la carpeta de instalación del plugin.
 
 ## Instalación
 
@@ -72,7 +72,7 @@ Consulta las lecturas, el estado y lo que haría el plugin, sin ejecutar accione
 herdr-usage status
 ```
 
-Evalúa el hook e imprime los comandos de herdr y systemd sin correrlos:
+Evalúa el hook e imprime los comandos de herdr y del programador del sistema sin correrlos:
 
 ```sh
 herdr-usage hook --dry-run
@@ -100,7 +100,7 @@ Desinstala el plugin y quita el bloque `statusLine` de `~/.claude/settings.json`
 herdr plugin uninstall herdr-usage
 ```
 
-Si quedó un regreso pendiente, consulta los timers y detén el correspondiente:
+Si quedó un regreso pendiente en Linux, consulta los timers y detén el correspondiente:
 
 ```sh
 systemctl --user list-timers 'herdr-usage-*'
@@ -110,7 +110,31 @@ systemctl --user list-timers 'herdr-usage-*'
 systemctl --user stop 'herdr-usage-resume-*.timer'
 ```
 
-Por último, elimina el enlace de la statusline:
+En macOS, consulta los LaunchAgents, descarga el correspondiente y borra su archivo `.plist`:
+
+```sh
+launchctl list | grep herdr-usage
+```
+
+```sh
+launchctl bootout gui/$(id -u)/<etiqueta>
+```
+
+```sh
+rm ~/Library/LaunchAgents/dev.herdr-usage.*.plist
+```
+
+En Windows, usa PowerShell para consultar las tareas pendientes y eliminarlas:
+
+```powershell
+Get-ScheduledTask -TaskPath '\herdr-usage\'
+```
+
+```powershell
+Get-ScheduledTask -TaskPath '\herdr-usage\' | Unregister-ScheduledTask -Confirm:$false
+```
+
+Por último, elimina el enlace de la statusline en Linux o macOS:
 
 ```sh
 rm ~/.local/bin/herdr-usage
@@ -118,7 +142,9 @@ rm ~/.local/bin/herdr-usage
 
 ## Límites conocidos
 
-El plugin recibe una lectura nueva cuando una sesión interactiva de Claude Code obtiene una respuesta y redibuja su statusline; `claude -p` no ejecuta la statusline. El regreso depende de systemd, por lo que funciona solo en Linux. Por ahora admite Claude Code; Codex está en el plan.
+El plugin recibe una lectura nueva cuando una sesión interactiva de Claude Code obtiene una respuesta y redibuja su statusline; `claude -p` no ejecuta la statusline. Linux es el entorno de uso diario del autor, con herdr. En macOS 26 (Apple Silicon) y Windows 11 pasaron las pruebas unitarias; en cada sistema se probó una tarea de regreso real que corrió a su hora. En macOS se borró sola; en Windows, una tarea creada desde una sesión de administrador no pudo borrarse y la quitó el vencimiento de una hora. Todavía no se ha probado la instalación completa con herdr en esos dos sistemas. Por ahora admite Claude Code; Codex está en el plan.
+
+En Windows, el plugin no crea el enlace estable `~/.local/bin/herdr-usage`. La statusline debe usar la ruta completa del binario instalado (`target\release\herdr-usage.exe` dentro de la carpeta del plugin); esa ruta cambia con cada `herdr plugin update`.
 
 El plugin tampoco detecta si un pane se cortó por el límite de uso. Al reiniciarse la ventana, intenta retomar los panes a los que antes les pidió el cierre, sujeto a las condiciones de sesión y reposo descritas arriba.
 

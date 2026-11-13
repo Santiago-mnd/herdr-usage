@@ -22,25 +22,27 @@ The plugin has four parts:
 
    The bar labels and agent messages are in Spanish; `sem` means *weekly*.
 
-2. **Handoff.** At 90%, the plugin asks working Claude panes, plus the pane that just finished its turn, to commit and push their branches. It also asks each agent to leave a short note about where it stopped and what comes next. It sends this request once per usage window.
+2. **Handoff.** At 90%, the plugin asks working Claude panes, plus the pane that just finished its turn, to commit and push their branches. It also asks each agent to leave a short note about where it stopped and what comes next. It sends this request once per usage window. If it could not list agents or send the request to a pane, it asks again on the next event before the reset; this also covers panes that start working after the first request.
 
-3. **Resume.** Two minutes after the reset, the plugin sends `retoma` (“resume”) to those same panes. It does so only when a pane still has the same agent session and its status is `idle` or `done`.
+3. **Resume.** Two minutes after the reset, the plugin sends `retoma` (“resume”) to those same panes. It does so only when a pane still has the same agent session and its status is `idle` or `done`. If sending the message fails or herdr does not respond, it retries after five minutes, up to three attempts in total.
 
 4. **Human notification.** Each event produces one `herdr notification show` notice for you, regardless of how many panes are involved.
 
 Agent messages begin with `[herdr-usage]`. See [docs/agents.md](docs/agents.md) for what those messages mean and what an agent is expected to do.
 
-There is no daemon. herdr runs `herdr-usage hook` when it starts and on each `pane.agent_status_changed` event; the process reads the saved usage, decides what to do, and exits in about 14 ms. For a pending resume, it creates one single-use systemd user timer named `herdr-usage-resume-<session>-<time>`, which removes itself afterward. Each herdr session keeps its own state.
+There is no daemon. herdr runs `herdr-usage hook` when it starts and on each `pane.agent_status_changed` event; the process reads the saved usage, decides what to do, and exits in about 14 ms. For a pending resume, the plugin creates a one-time task named `herdr-usage-resume-<session>-<time>` using a systemd user timer on Linux, a LaunchAgent on macOS, or Task Scheduler on Windows. Each herdr session keeps its own state.
+
+On Linux, the timer removes itself after running. On macOS, the LaunchAgent lives at `~/Library/LaunchAgents/dev.herdr-usage.herdr-usage-resume-<session>-<time>.plist`; launchd runs it at the scheduled time, rounded up to the next minute, and the run unloads it and removes the file. On Windows, the task lives in Task Scheduler’s `\herdr-usage\` folder; it attempts to remove itself after running and expires one hour after its scheduled time. If a task does not run because the machine was off or the task was removed, the next herdr event after the reset triggers the resume.
 
 The plugin makes no network calls or requests to external services. Its usage data comes from the JSON Claude Code already passes to the statusline. If multiple Claude sessions write readings at once, the plugin keeps the most recent window and, within that window, the highest percentage.
 
 ## Requirements
 
-- Linux with systemd user services (`systemctl --user`). macOS is not supported yet.
+- Linux, macOS, or Windows. The plugin manifest declares all three platforms.
 - herdr 0.9.5 or newer.
-- Rust and `cargo`. herdr builds the plugin locally with `cargo build --release --locked` during installation, so `cargo` must be on the `PATH` of the shell where you run `herdr plugin install`. A standard rustup install adds `~/.cargo/bin` to it.
+- Rust and `cargo`. herdr builds the plugin locally with `cargo build --release --locked` during installation, so `cargo` must be on the `PATH` of the shell where you run `herdr plugin install`. A standard rustup install adds `~/.cargo/bin` to it. On Windows, the default Rust MSVC toolchain also needs Visual Studio Build Tools with C++.
 - Claude Code.
-- `~/.local/bin` on your `PATH`, or the full path to the link in your statusline command.
+- On Linux and macOS, `~/.local/bin` on your `PATH`, or the full path to the link in your statusline command. On Windows, point the statusline to the installed binary’s full path, `target\release\herdr-usage.exe` inside the plugin installation directory. That path changes with each `herdr plugin update`.
 
 ## Install
 
@@ -78,7 +80,7 @@ Inspect saved readings, state, and the action the plugin would take:
 herdr-usage status
 ```
 
-Evaluate the hook and print its herdr and systemd commands without running them:
+Evaluate the hook and print its herdr and system scheduler commands without running them:
 
 ```sh
 herdr-usage hook --dry-run
@@ -106,17 +108,51 @@ Remove the plugin:
 herdr plugin uninstall herdr-usage
 ```
 
-Remove the `statusLine` block from `~/.claude/settings.json`. If a resume is pending, list its timers, then stop the pending timer:
+Remove the `statusLine` block from `~/.claude/settings.json`. If a resume is pending, use the commands for your system to find and remove its scheduled task.
+
+On Linux, list the timers:
 
 ```sh
 systemctl --user list-timers 'herdr-usage-*'
 ```
 
+Then stop the pending timer:
+
 ```sh
 systemctl --user stop 'herdr-usage-resume-*.timer'
 ```
 
-Finally, remove the statusline link:
+On macOS, list the LaunchAgents:
+
+```sh
+launchctl list | grep herdr-usage
+```
+
+Unload each pending LaunchAgent, replacing `<label>` with its label:
+
+```sh
+launchctl bootout gui/$(id -u)/<label>
+```
+
+Then remove its `.plist` file:
+
+```sh
+rm ~/Library/LaunchAgents/dev.herdr-usage.*.plist
+```
+
+On Windows, run these commands in PowerShell to list the pending tasks:
+
+```powershell
+Get-ScheduledTask -TaskPath '\herdr-usage\'
+```
+
+Then unregister them:
+
+```powershell
+Get-ScheduledTask -TaskPath '\herdr-usage\' | Unregister-ScheduledTask -Confirm:$false
+```
+
+Finally, remove the statusline link on Linux or macOS:
 
 ```sh
 rm ~/.local/bin/herdr-usage
@@ -124,7 +160,9 @@ rm ~/.local/bin/herdr-usage
 
 ## Known limits
 
-The plugin learns about usage only when an interactive Claude Code session receives a response and redraws its statusline; `claude -p` does not run it. Resume currently requires Linux and systemd, and Claude is the only supported agent for now. Codex support is planned.
+The plugin learns about usage only when an interactive Claude Code session receives a response and redraws its statusline; `claude -p` does not run it. Linux on the author’s VPS is the daily-use setup with herdr. On macOS 26 (Apple Silicon) and Windows 11, the unit tests passed, and a real scheduled resume task ran on time. On macOS it removed itself; on Windows, a task created from an administrator session could not remove itself and was removed by the one-hour expiry instead; full installation with herdr has not yet been tested on either system.
+
+Claude is the only supported agent for now. Codex support is planned. On Windows, the stable `~/.local/bin/herdr-usage` link is not created, so the statusline command must use the installed binary’s full path and be updated after each `herdr plugin update`.
 
 The plugin does not detect whether a pane actually stopped because of a usage limit. It resumes the panes it previously asked to hand off, subject to the session and status checks above.
 
