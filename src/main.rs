@@ -5,28 +5,26 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Duration, Local, Utc};
+use herdr_usage::schedule::job_name;
 use herdr_usage::{
-    Action, Agent, Limit, LinkAction, LinkState, PaneRef, RESUME_PROMPT, Readiness, State, Wrap, catch_up_targets, evaluate,
+    Action, Agent, Limit, PaneRef, RESUME_PROMPT, Readiness, State, Wrap, catch_up_targets, evaluate,
     in_wrap_window, kind_label, limits_from_statusline, merge_limits, meter_json, parse_meter, readiness, render_meter,
-    retry_resume, session_from_socket, stable_link_action, timer_needed, wrap_up_prompt, wrap_up_targets,
+    retry_resume, session_from_socket, timer_needed, wrap_up_prompt, wrap_up_targets,
 };
 use serde_json::Value;
+#[cfg(unix)]
+use herdr_usage::{LinkAction, LinkState, stable_link_action};
 
 const PLUGIN_STATE_SUBDIR: &str = "herdr/plugins/herdr-usage";
 const METER_FILE: &str = "meter/claude.json";
+#[cfg(unix)]
 const STABLE_LINK: &str = ".local/bin/herdr-usage";
-const TIMER_ENV: [&str; 4] = [
-    "HERDR_BIN_PATH",
-    "HERDR_SOCKET_PATH",
-    "HERDR_PLUGIN_STATE_DIR",
-    "HERDR_PLUGIN_ID",
-];
 const HELP: &str = "herdr-usage: plugin de herdr que mide el uso del plan de Claude y actúa sobre los panes.
 
 Uso: herdr-usage <hook|status|statusline> [opciones]
 
 Comandos:
-  hook                evalúa el uso y actúa; lo llaman los eventos de herdr, el arranque y el timer de regreso
+  hook                evalúa el uso y actúa; lo llaman los eventos de herdr, el arranque y la tarea de regreso
   status              muestra lecturas, estado y lo que haría, sin actuar
   statusline          statusline de Claude Code: lee el JSON por stdin, guarda el uso y dibuja la barra
 
@@ -35,7 +33,10 @@ Opciones:
   --state <ruta>      archivo de estado (por defecto <estado del plugin>/<sesión>.json)
   --threshold <n>     porcentaje que dispara el cierre ordenado (por defecto 90)
   --margin <min>      minutos de espera después del reinicio antes de retomar (por defecto 2)
-  --dry-run           imprime los comandos de herdr y de systemd en vez de correrlos
+  --herdr <ruta>      binario de herdr (por defecto HERDR_BIN_PATH o herdr)
+  --socket <ruta>     socket de la sesión de herdr (por defecto HERDR_SOCKET_PATH)
+  --job <nombre>      lo pasa la tarea de regreso para borrarse al terminar
+  --dry-run           imprime los comandos de herdr y del programador en vez de correrlos
   --only-pane <id>    para pruebas: el cierre solo se le pide a ese pane
   -h, --help          muestra esta ayuda";
 
@@ -58,10 +59,15 @@ struct Config {
     event: Option<String>,
     event_pane: Option<String>,
     only_pane: Option<String>,
+    socket: Option<String>,
+    job: Option<String>,
 }
 
 fn home() -> PathBuf {
-    env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root"))
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn plugin_state_dir() -> PathBuf {
@@ -80,7 +86,6 @@ fn event_pane() -> Option<String> {
 }
 
 fn parse_args() -> Result<Option<Config>, String> {
-    let session = session_from_socket(env::var("HERDR_SOCKET_PATH").ok().as_deref());
     let state_dir = plugin_state_dir();
     let mut args = env::args().skip(1);
     let mode = match args.next().as_deref() {
@@ -93,17 +98,19 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut config = Config {
         mode,
         meter: state_dir.join(METER_FILE),
-        state: state_dir.join(format!("{session}.json")),
+        state: PathBuf::new(),
         threshold: 90.0,
         margin: Duration::minutes(2),
         dry_run: false,
         herdr: env::var("HERDR_BIN_PATH")
             .or_else(|_| env::var("HERDR_BIN"))
             .unwrap_or_else(|_| "herdr".into()),
-        session,
+        session: String::new(),
         event: env::var("HERDR_PLUGIN_EVENT").ok(),
         event_pane: event_pane(),
         only_pane: None,
+        socket: env::var("HERDR_SOCKET_PATH").ok(),
+        job: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("falta el valor de {name}"));
@@ -123,9 +130,16 @@ fn parse_args() -> Result<Option<Config>, String> {
             }
             "--dry-run" => config.dry_run = true,
             "--only-pane" => config.only_pane = Some(value("--only-pane")?),
+            "--herdr" => config.herdr = value("--herdr")?,
+            "--socket" => config.socket = Some(value("--socket")?),
+            "--job" => config.job = Some(value("--job")?),
             "-h" | "--help" => return Ok(None),
             other => return Err(format!("opción desconocida: {other}")),
         }
+    }
+    config.session = session_from_socket(config.socket.as_deref());
+    if config.state.as_os_str().is_empty() {
+        config.state = state_dir.join(format!("{}.json", config.session));
     }
     Ok(Some(config))
 }
@@ -177,6 +191,10 @@ fn store_fresh_limits(path: &Path, fresh: &[Limit]) -> std::io::Result<Vec<Limit
     Ok(merged)
 }
 
+#[cfg(not(unix))]
+fn ensure_stable_link(_config: &Config) {}
+
+#[cfg(unix)]
 fn ensure_stable_link(config: &Config) {
     if config.dry_run || env::var_os("HERDR_PLUGIN_ID").is_none() {
         return;
@@ -221,12 +239,17 @@ fn statusline(config: &Config) {
 
 struct Herdr<'a> {
     bin: &'a str,
+    socket: Option<&'a str>,
     dry_run: bool,
 }
 
 impl Herdr<'_> {
     fn query(&self, args: &[&str]) -> Result<Value, String> {
-        let output = Command::new(self.bin)
+        let mut command = Command::new(self.bin);
+        if let Some(socket) = self.socket {
+            command.env("HERDR_SOCKET_PATH", socket);
+        }
+        let output = command
             .args(args)
             .output()
             .map_err(|err| format!("no pude correr {}: {err}", self.bin))?;
@@ -399,17 +422,6 @@ fn resume(herdr: &Herdr, wrap: &Wrap) -> Option<Wrap> {
     retry
 }
 
-fn timer_unit(session: &str, at: DateTime<Utc>) -> String {
-    format!("herdr-usage-resume-{session}-{}", at.timestamp())
-}
-
-fn timer_active(unit: &str) -> bool {
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", &format!("{unit}.timer")])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 fn run_or_print(config: &Config, program: &str, args: &[String]) -> Result<(), String> {
     if config.dry_run {
         log(&format!("[dry-run] {program} {}", args.join(" ")));
@@ -426,29 +438,18 @@ fn run_or_print(config: &Config, program: &str, args: &[String]) -> Result<(), S
     }
 }
 
-fn cancel_timer(config: &Config, at: DateTime<Utc>) {
-    let unit = format!("{}.timer", timer_unit(&config.session, at));
-    let _ = run_or_print(config, "systemctl", &["--user".into(), "stop".into(), unit]);
+fn succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
-fn arm_timer(config: &Config, at: DateTime<Utc>) -> Result<(), String> {
+fn job_program(config: &Config, job: &str) -> Result<Vec<String>, String> {
     let exe = env::current_exe().map_err(|err| format!("no sé dónde está el binario: {err}"))?;
-    let mut args: Vec<String> = vec![
-        "--user".into(),
-        "--collect".into(),
-        "--quiet".into(),
-        "--unit".into(),
-        timer_unit(&config.session, at),
-        "--on-calendar".into(),
-        at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        "--timer-property=AccuracySec=1s".into(),
-    ];
-    args.extend(
-        TIMER_ENV
-            .iter()
-            .filter_map(|key| env::var(key).ok().map(|value| format!("--setenv={key}={value}"))),
-    );
-    args.extend([
+    let mut program: Vec<String> = vec![
         exe.display().to_string(),
         "hook".into(),
         "--meter".into(),
@@ -459,8 +460,134 @@ fn arm_timer(config: &Config, at: DateTime<Utc>) -> Result<(), String> {
         config.threshold.to_string(),
         "--margin".into(),
         config.margin.num_minutes().to_string(),
-    ]);
-    run_or_print(config, "systemd-run", &args)
+        "--herdr".into(),
+        config.herdr.clone(),
+    ];
+    if let Some(socket) = &config.socket {
+        program.extend(["--socket".into(), socket.clone()]);
+    }
+    program.extend(["--job".into(), job.to_string()]);
+    Ok(program)
+}
+
+#[cfg(target_os = "linux")]
+mod scheduler {
+    use super::*;
+
+    pub fn arm(config: &Config, job: &str, at: DateTime<Utc>) -> Result<(), String> {
+        let mut args: Vec<String> = vec![
+            "--user".into(),
+            "--collect".into(),
+            "--quiet".into(),
+            "--unit".into(),
+            job.into(),
+            "--on-calendar".into(),
+            at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            "--timer-property=AccuracySec=1s".into(),
+        ];
+        args.extend(job_program(config, job)?);
+        run_or_print(config, "systemd-run", &args)
+    }
+
+    pub fn cancel(config: &Config, job: &str) {
+        let _ = run_or_print(config, "systemctl", &["--user".into(), "stop".into(), format!("{job}.timer")]);
+    }
+
+    pub fn exists(job: &str) -> bool {
+        succeeds("systemctl", &["--user", "is-active", "--quiet", &format!("{job}.timer")])
+    }
+
+    pub fn finish(_config: &Config, _job: &str) {}
+
+    pub fn describe(job: &str) -> String {
+        format!("{job}.timer (systemd de usuario)")
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod scheduler {
+    use super::*;
+    use herdr_usage::schedule::{launchd_label, launchd_plist};
+
+    fn domain() -> String {
+        let uid = Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default();
+        format!("gui/{uid}")
+    }
+
+    fn plist_path(label: &str) -> PathBuf {
+        home().join("Library/LaunchAgents").join(format!("{label}.plist"))
+    }
+
+    pub fn arm(config: &Config, job: &str, at: DateTime<Utc>) -> Result<(), String> {
+        let label = launchd_label(job);
+        let path = plist_path(&label);
+        let plist = launchd_plist(&label, &job_program(config, job)?, at.with_timezone(&Local));
+        if config.dry_run {
+            log(&format!("[dry-run] escribiría {}:\n{plist}", path.display()));
+        } else {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).map_err(|err| format!("no pude crear {}: {err}", dir.display()))?;
+            }
+            fs::write(&path, plist).map_err(|err| format!("no pude escribir {}: {err}", path.display()))?;
+        }
+        run_or_print(config, "launchctl", &["bootstrap".into(), domain(), path.display().to_string()])
+    }
+
+    pub fn cancel(config: &Config, job: &str) {
+        let label = launchd_label(job);
+        if !config.dry_run {
+            let _ = fs::remove_file(plist_path(&label));
+        }
+        let _ = run_or_print(config, "launchctl", &["bootout".into(), format!("{}/{label}", domain())]);
+    }
+
+    pub fn exists(job: &str) -> bool {
+        succeeds("launchctl", &["print", &format!("{}/{}", domain(), launchd_label(job))])
+    }
+
+    pub fn finish(config: &Config, job: &str) {
+        cancel(config, job);
+    }
+
+    pub fn describe(job: &str) -> String {
+        format!("{} (launchd)", launchd_label(job))
+    }
+}
+
+#[cfg(windows)]
+mod scheduler {
+    use super::*;
+    use herdr_usage::schedule::{windows_register_script, windows_task};
+
+    pub fn arm(config: &Config, job: &str, at: DateTime<Utc>) -> Result<(), String> {
+        let script = windows_register_script(job, &job_program(config, job)?, at.with_timezone(&Local));
+        run_or_print(
+            config,
+            "powershell",
+            &["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script],
+        )
+    }
+
+    pub fn cancel(config: &Config, job: &str) {
+        let _ = run_or_print(config, "schtasks", &["/Delete".into(), "/TN".into(), windows_task(job), "/F".into()]);
+    }
+
+    pub fn exists(job: &str) -> bool {
+        succeeds("schtasks", &["/Query", "/TN", &windows_task(job)])
+    }
+
+    pub fn finish(config: &Config, job: &str) {
+        cancel(config, job);
+    }
+
+    pub fn describe(job: &str) -> String {
+        format!("{} (Programador de tareas)", windows_task(job))
+    }
 }
 
 fn sync_timer(config: &Config, state: &mut State) {
@@ -468,21 +595,24 @@ fn sync_timer(config: &Config, state: &mut State) {
         state.timer_for = None;
         return;
     };
-    if config.event.as_deref() == Some("startup") && !timer_active(&timer_unit(&config.session, wrap.resume_at)) {
+    if config.event.as_deref() == Some("startup") && !scheduler::exists(&job_name(&config.session, wrap.resume_at)) {
         state.timer_for = None;
     }
     let Some(at) = timer_needed(state) else {
         return;
     };
     if let Some(previous) = state.timer_for {
-        cancel_timer(config, previous);
+        let previous = job_name(&config.session, previous);
+        if config.job.as_deref() != Some(previous.as_str()) {
+            scheduler::cancel(config, &previous);
+        }
     }
-    match arm_timer(config, at) {
+    match scheduler::arm(config, &job_name(&config.session, at), at) {
         Ok(()) => {
             state.timer_for = Some(at);
-            log(&format!("timer de regreso armado para {}", when_text(at)));
+            log(&format!("tarea de regreso programada para {}", when_text(at)));
         }
-        Err(err) => log(&format!("no pude armar el timer de regreso: {err}")),
+        Err(err) => log(&format!("no pude programar la tarea de regreso: {err}")),
     }
 }
 
@@ -498,9 +628,9 @@ fn status(config: &Config, limits: &[Limit], state: &State, action: &Action) {
     println!("sesión: {}", config.session);
     println!("estado ({}): {}", config.state.display(), serde_json::to_string(state).unwrap_or_default());
     if let Some(at) = state.timer_for {
-        let unit = timer_unit(&config.session, at);
-        let active = if timer_active(&unit) { "activo" } else { "no está activo" };
-        println!("timer: {unit}.timer, {active}");
+        let job = job_name(&config.session, at);
+        let active = if scheduler::exists(&job) { "programada" } else { "no está programada" };
+        println!("tarea de regreso: {}, {active}", scheduler::describe(&job));
     }
     println!("haría: {action:?}");
 }
@@ -570,8 +700,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     ensure_stable_link(&config);
-    let herdr = Herdr { bin: &config.herdr, dry_run: config.dry_run };
-    match hook(&config, &herdr) {
+    let herdr = Herdr {
+        bin: &config.herdr,
+        socket: config.socket.as_deref(),
+        dry_run: config.dry_run,
+    };
+    let result = hook(&config, &herdr);
+    if let Some(job) = &config.job {
+        scheduler::finish(&config, job);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             log(&err);
