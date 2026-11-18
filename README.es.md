@@ -2,7 +2,7 @@
 
 [Read in English](README.md)
 
-**herdr-usage** es un plugin de [herdr](https://herdr.dev), el multiplexor de terminal para agentes de código. Está escrito en Rust, va en la versión 0.2.0 y se encuentra en una etapa temprana; su autor lo usa a diario en un VPS Linux con varios panes de agentes abiertos a la vez.
+**herdr-usage** es un plugin de [herdr](https://herdr.dev), el multiplexor de terminal para agentes de código. Está escrito en Rust, va en la versión 0.3.0 y se encuentra en una etapa temprana; su autor lo usa a diario en un VPS Linux con varios panes de agentes abiertos a la vez.
 
 Cuando se agota una ventana de uso del plan de Claude o Codex, un agente puede quedarse a media tarea. El plugin muestra cuánto uso queda en la barra de Claude Code, pide a los agentes que preparen un cierre al llegar al umbral y programa su regreso después del reinicio.
 

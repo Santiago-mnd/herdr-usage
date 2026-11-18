@@ -2,7 +2,7 @@
 
 [Leer en español](README.es.md)
 
-herdr-usage is an early-stage, Rust-based plugin for [herdr](https://herdr.dev), a terminal multiplexer for coding agents. Santiago García uses version 0.2.0 daily on a Linux VPS with several Claude Code panes running at once.
+herdr-usage is an early-stage, Rust-based plugin for [herdr](https://herdr.dev), a terminal multiplexer for coding agents. Santiago García uses version 0.3.0 daily on a Linux VPS with several Claude Code panes running at once.
 
 When a Claude Code or Codex CLI plan’s usage window runs out, agents can stop midway through a task. herdr-usage asks them to leave a handoff before the limit, then prompts those same panes to resume after the window resets.
 
