@@ -1,7 +1,12 @@
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
-pub fn job_name(session: &str, at: DateTime<Utc>) -> String {
-    format!("herdr-usage-resume-{session}-{}", at.timestamp())
+use crate::Provider;
+
+pub fn job_name(provider: Provider, session: &str, at: DateTime<Utc>) -> String {
+    match provider {
+        Provider::Claude => format!("herdr-usage-resume-{session}-{}", at.timestamp()),
+        other => format!("herdr-usage-{}-resume-{session}-{}", other.id(), at.timestamp()),
+    }
 }
 
 pub fn launchd_label(job: &str) -> String {
@@ -123,7 +128,14 @@ mod tests {
     #[test]
     fn job_name_has_session_and_time() {
         let at = Utc.with_ymd_and_hms(2026, 11, 8, 10, 0, 0).unwrap();
-        assert_eq!(job_name("default", at), format!("herdr-usage-resume-default-{}", at.timestamp()));
+        assert_eq!(
+            job_name(Provider::Claude, "default", at),
+            format!("herdr-usage-resume-default-{}", at.timestamp())
+        );
+        assert_eq!(
+            job_name(Provider::Codex, "default", at),
+            format!("herdr-usage-codex-resume-default-{}", at.timestamp())
+        );
     }
 
     #[test]
