@@ -1,25 +1,28 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Duration, Local, Utc};
 use herdr_usage::schedule::job_name;
 use herdr_usage::{
-    Action, Agent, Limit, PaneRef, RESUME_PROMPT, Readiness, State, Wrap, catch_up_targets, evaluate,
-    in_wrap_window, kind_label, limits_from_statusline, merge_limits, meter_json, parse_meter, readiness, render_meter,
-    retry_resume, session_from_socket, timer_needed, wrap_up_prompt, wrap_up_targets,
+    Action, Agent, Limit, PaneRef, Provider, RESUME_PROMPT, Readiness, State, Wrap, catch_up_targets, evaluate,
+    in_wrap_window, kind_label, limits_from_codex_rollout, limits_from_statusline, merge_limits, meter_json,
+    parse_meter, readiness, render_meter, retry_resume, session_from_socket, timer_needed, wrap_up_prompt,
+    wrap_up_targets,
 };
 use serde_json::Value;
 #[cfg(unix)]
 use herdr_usage::{LinkAction, LinkState, stable_link_action};
 
 const PLUGIN_STATE_SUBDIR: &str = "herdr/plugins/herdr-usage";
-const METER_FILE: &str = "meter/claude.json";
+const CODEX_DAYS_SCANNED: usize = 7;
+const CODEX_FILES_TRIED: usize = 3;
+const CODEX_TAIL_BYTES: u64 = 1 << 20;
 #[cfg(unix)]
 const STABLE_LINK: &str = ".local/bin/herdr-usage";
-const HELP: &str = "herdr-usage: plugin de herdr que mide el uso del plan de Claude y actúa sobre los panes.
+const HELP: &str = "herdr-usage: plugin de herdr que mide el uso del plan de Claude y de Codex y actúa sobre sus panes.
 
 Uso: herdr-usage <hook|status|statusline> [opciones]
 
@@ -29,8 +32,10 @@ Comandos:
   statusline          statusline de Claude Code: lee el JSON por stdin, guarda el uso y dibuja la barra
 
 Opciones:
-  --meter <ruta>      archivo de uso (por defecto <estado del plugin>/meter/claude.json)
-  --state <ruta>      archivo de estado (por defecto <estado del plugin>/<sesión>.json)
+  --provider <id>     claude o codex: evalúa solo ese proveedor (por defecto los dos; Codex solo si existe su carpeta)
+  --meter <ruta>      archivo de uso (por defecto <estado del plugin>/meter/<proveedor>.json); sin --provider es el de Claude
+  --state <ruta>      archivo de estado (por defecto <estado del plugin>/<sesión>.json para Claude
+                      y <estado del plugin>/codex/<sesión>.json para Codex); sin --provider es el de Claude
   --threshold <n>     porcentaje que dispara el cierre ordenado (por defecto 90)
   --margin <min>      minutos de espera después del reinicio antes de retomar (por defecto 2)
   --herdr <ruta>      binario de herdr (por defecto HERDR_BIN_PATH o herdr)
@@ -40,17 +45,21 @@ Opciones:
   --only-pane <id>    para pruebas: el cierre solo se le pide a ese pane
   -h, --help          muestra esta ayuda";
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Mode {
     Hook,
     Status,
     Statusline,
 }
 
+#[derive(Clone)]
 struct Config {
     mode: Mode,
-    meter: PathBuf,
-    state: PathBuf,
+    provider: Provider,
+    providers: Vec<Provider>,
+    state_dir: PathBuf,
+    meter: Option<PathBuf>,
+    state: Option<PathBuf>,
     threshold: f64,
     margin: Duration,
     dry_run: bool,
@@ -79,6 +88,26 @@ fn plugin_state_dir() -> PathBuf {
     })
 }
 
+impl Config {
+    fn for_provider(&self, provider: Provider) -> Config {
+        Config { provider, ..self.clone() }
+    }
+
+    fn meter_path(&self) -> PathBuf {
+        self.meter
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("meter").join(format!("{}.json", self.provider.id())))
+    }
+
+    fn state_path(&self) -> PathBuf {
+        let file = format!("{}.json", self.session);
+        self.state.clone().unwrap_or_else(|| match self.provider {
+            Provider::Claude => self.state_dir.join(file),
+            other => self.state_dir.join(other.id()).join(file),
+        })
+    }
+}
+
 fn event_pane() -> Option<String> {
     let raw = env::var("HERDR_PLUGIN_EVENT_JSON").ok()?;
     let event: Value = serde_json::from_str(&raw).ok()?;
@@ -97,8 +126,11 @@ fn parse_args() -> Result<Option<Config>, String> {
     };
     let mut config = Config {
         mode,
-        meter: state_dir.join(METER_FILE),
-        state: PathBuf::new(),
+        provider: Provider::Claude,
+        providers: Vec::new(),
+        state_dir,
+        meter: None,
+        state: None,
         threshold: 90.0,
         margin: Duration::minutes(2),
         dry_run: false,
@@ -112,11 +144,16 @@ fn parse_args() -> Result<Option<Config>, String> {
         socket: env::var("HERDR_SOCKET_PATH").ok(),
         job: None,
     };
+    let mut provider = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("falta el valor de {name}"));
         match arg.as_str() {
-            "--meter" => config.meter = value("--meter")?.into(),
-            "--state" => config.state = value("--state")?.into(),
+            "--provider" => {
+                let raw = value("--provider")?;
+                provider = Some(Provider::parse(&raw).ok_or(format!("proveedor desconocido: {raw} (usa claude o codex)"))?);
+            }
+            "--meter" => config.meter = Some(value("--meter")?.into()),
+            "--state" => config.state = Some(value("--state")?.into()),
             "--threshold" => {
                 config.threshold = value("--threshold")?
                     .parse()
@@ -138,9 +175,19 @@ fn parse_args() -> Result<Option<Config>, String> {
         }
     }
     config.session = session_from_socket(config.socket.as_deref());
-    if config.state.as_os_str().is_empty() {
-        config.state = state_dir.join(format!("{}.json", config.session));
+    let overrides = config.meter.is_some() || config.state.is_some();
+    config.providers = match (provider, overrides) {
+        (Some(provider), _) => vec![provider],
+        (None, true) => vec![Provider::Claude],
+        (None, false) => Provider::ALL.to_vec(),
+    };
+    if config.mode == Mode::Statusline {
+        if provider.is_some_and(|provider| provider != Provider::Claude) {
+            return Err("statusline solo funciona con Claude Code".into());
+        }
+        config.providers = vec![Provider::Claude];
     }
+    config.provider = config.providers[0];
     Ok(Some(config))
 }
 
@@ -191,6 +238,89 @@ fn store_fresh_limits(path: &Path, fresh: &[Limit]) -> std::io::Result<Vec<Limit
     Ok(merged)
 }
 
+fn codex_sessions_dir() -> PathBuf {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".codex"))
+        .join("sessions")
+}
+
+fn subdirs_newest_first(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    dirs
+}
+
+fn recent_codex_rollouts() -> Vec<PathBuf> {
+    let days: Vec<PathBuf> = subdirs_newest_first(&codex_sessions_dir())
+        .into_iter()
+        .flat_map(|year| subdirs_newest_first(&year))
+        .flat_map(|month| subdirs_newest_first(&month))
+        .take(CODEX_DAYS_SCANNED)
+        .collect();
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = days
+        .iter()
+        .flat_map(|day| fs::read_dir(day).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(bytes)))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn codex_limits() -> Option<Vec<Limit>> {
+    recent_codex_rollouts()
+        .iter()
+        .take(CODEX_FILES_TRIED)
+        .find_map(|path| limits_from_codex_rollout(&read_tail(path, CODEX_TAIL_BYTES).ok()?))
+}
+
+fn current_limits(config: &Config) -> Vec<Limit> {
+    let meter = config.meter_path();
+    let fresh = match config.provider {
+        Provider::Claude => None,
+        Provider::Codex => codex_limits(),
+    };
+    match fresh {
+        Some(fresh) if config.dry_run || config.mode == Mode::Status => {
+            merge_limits(&read_limits(&meter).unwrap_or_default(), &fresh)
+        }
+        Some(fresh) => store_fresh_limits(&meter, &fresh).unwrap_or_else(|err| {
+            log(&format!("no pude guardar el uso de {}: {err}", config.provider.name()));
+            merge_limits(&read_limits(&meter).unwrap_or_default(), &fresh)
+        }),
+        None => read_limits(&meter).unwrap_or_else(|err| {
+            if config.provider == Provider::Claude {
+                log(&err);
+            }
+            Vec::new()
+        }),
+    }
+}
+
+fn provider_present(config: &Config) -> bool {
+    config.provider != Provider::Codex
+        || config.providers.len() == 1
+        || codex_sessions_dir().is_dir()
+        || config.state_path().exists()
+}
+
 #[cfg(not(unix))]
 fn ensure_stable_link(_config: &Config) {}
 
@@ -231,8 +361,8 @@ fn statusline(config: &Config) {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let fresh = limits_from_statusline(&raw).unwrap_or_default();
-    let limits = store_fresh_limits(&config.meter, &fresh)
-        .unwrap_or_else(|_| read_limits(&config.meter).unwrap_or(fresh));
+    let meter = config.meter_path();
+    let limits = store_fresh_limits(&meter, &fresh).unwrap_or_else(|_| read_limits(&meter).unwrap_or(fresh));
     let columns = std::env::var("COLUMNS").ok().and_then(|value| value.parse().ok());
     println!("{}", render_meter(&limits, Utc::now(), columns));
 }
@@ -317,6 +447,10 @@ fn kinds_text(kinds: &[String]) -> String {
     kinds.iter().map(|kind| kind_label(kind)).collect::<Vec<_>>().join(" y ")
 }
 
+fn usage_text(config: &Config, kinds: &[String]) -> String {
+    format!("uso {} de {}", kinds_text(kinds), config.provider.name())
+}
+
 fn when_text(moment: DateTime<Utc>) -> String {
     let local = moment.with_timezone(&Local);
     if local.date_naive() == Local::now().date_naive() {
@@ -330,7 +464,7 @@ fn wrap_up(config: &Config, herdr: &Herdr, limits: &[Limit], kinds: Vec<String>,
     let text = wrap_up_prompt(limits, &kinds);
     let listed = herdr.agents();
     let targets = match &listed {
-        Ok(agents) => wrap_up_targets(agents, config.event_pane.as_deref()),
+        Ok(agents) => wrap_up_targets(agents, config.provider, config.event_pane.as_deref()),
         Err(err) => {
             log(&format!("no pude listar los agentes: {err}"));
             Vec::new()
@@ -349,9 +483,17 @@ fn wrap_up(config: &Config, herdr: &Herdr, limits: &[Limit], kinds: Vec<String>,
             plural(reached.len())
         )
     };
-    herdr.notify(&format!("Uso {} cerca del límite", kinds_text(&kinds)), &body);
-    log(&body);
+    herdr.notify(&format!("{} cerca del límite", capitalize(&usage_text(config, &kinds))), &body);
+    log(&format!("{}: {body}", config.provider.name()));
     Wrap { resume_at, kinds, panes: reached, attempts: 0 }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 fn deliver(config: &Config, herdr: &Herdr, targets: Vec<PaneRef>, text: &str) -> Vec<PaneRef> {
@@ -376,18 +518,23 @@ fn catch_up(config: &Config, herdr: &Herdr, limits: &[Limit], wrap: &mut Wrap) {
             return;
         }
     };
-    let targets = catch_up_targets(&agents, config.event_pane.as_deref(), wrap);
+    let targets = catch_up_targets(&agents, config.provider, config.event_pane.as_deref(), wrap);
     if targets.is_empty() {
         return;
     }
     let reached = deliver(config, herdr, targets, &wrap_up_prompt(limits, &wrap.kinds));
     if !reached.is_empty() {
-        log(&format!("pedí cierre ordenado a {} pane{} más", reached.len(), plural(reached.len())));
+        log(&format!(
+            "{}: pedí cierre ordenado a {} pane{} más",
+            config.provider.name(),
+            reached.len(),
+            plural(reached.len())
+        ));
         wrap.panes.extend(reached);
     }
 }
 
-fn resume(herdr: &Herdr, wrap: &Wrap) -> Option<Wrap> {
+fn resume(config: &Config, herdr: &Herdr, wrap: &Wrap) -> Option<Wrap> {
     let mut resumed = 0;
     let mut failed = Vec::new();
     for pane in &wrap.panes {
@@ -415,10 +562,10 @@ fn resume(herdr: &Herdr, wrap: &Wrap) -> Option<Wrap> {
     }
     let first = wrap.attempts == 0;
     if first || retry.is_none() {
-        let title = if first { "Se reinició el uso" } else { "Reintento de regreso, uso" };
-        herdr.notify(&format!("{title} {}", kinds_text(&wrap.kinds)), &body);
+        let title = if first { "Se reinició el" } else { "Reintento de regreso," };
+        herdr.notify(&format!("{title} {}", usage_text(config, &wrap.kinds)), &body);
     }
-    log(&body);
+    log(&format!("{}: {body}", config.provider.name()));
     retry
 }
 
@@ -452,10 +599,12 @@ fn job_program(config: &Config, job: &str) -> Result<Vec<String>, String> {
     let mut program: Vec<String> = vec![
         exe.display().to_string(),
         "hook".into(),
+        "--provider".into(),
+        config.provider.id().into(),
         "--meter".into(),
-        config.meter.display().to_string(),
+        config.meter_path().display().to_string(),
         "--state".into(),
-        config.state.display().to_string(),
+        config.state_path().display().to_string(),
         "--threshold".into(),
         config.threshold.to_string(),
         "--margin".into(),
@@ -595,28 +744,34 @@ fn sync_timer(config: &Config, state: &mut State) {
         state.timer_for = None;
         return;
     };
-    if config.event.as_deref() == Some("startup") && !scheduler::exists(&job_name(&config.session, wrap.resume_at)) {
+    let job_for = |at| job_name(config.provider, &config.session, at);
+    if config.event.as_deref() == Some("startup") && !scheduler::exists(&job_for(wrap.resume_at)) {
         state.timer_for = None;
     }
     let Some(at) = timer_needed(state) else {
         return;
     };
     if let Some(previous) = state.timer_for {
-        let previous = job_name(&config.session, previous);
+        let previous = job_for(previous);
         if config.job.as_deref() != Some(previous.as_str()) {
             scheduler::cancel(config, &previous);
         }
     }
-    match scheduler::arm(config, &job_name(&config.session, at), at) {
+    let name = config.provider.name();
+    match scheduler::arm(config, &job_for(at), at) {
         Ok(()) => {
             state.timer_for = Some(at);
-            log(&format!("tarea de regreso programada para {}", when_text(at)));
+            log(&format!("{name}: tarea de regreso programada para {}", when_text(at)));
         }
-        Err(err) => log(&format!("no pude programar la tarea de regreso: {err}")),
+        Err(err) => log(&format!("{name}: no pude programar la tarea de regreso: {err}")),
     }
 }
 
 fn status(config: &Config, limits: &[Limit], state: &State, action: &Action) {
+    println!("[{}]", config.provider.name());
+    if limits.is_empty() {
+        println!("sin lecturas de uso");
+    }
     for limit in limits {
         println!(
             "{}: {:.0} %, se reinicia {}",
@@ -626,9 +781,9 @@ fn status(config: &Config, limits: &[Limit], state: &State, action: &Action) {
         );
     }
     println!("sesión: {}", config.session);
-    println!("estado ({}): {}", config.state.display(), serde_json::to_string(state).unwrap_or_default());
+    println!("estado ({}): {}", config.state_path().display(), serde_json::to_string(state).unwrap_or_default());
     if let Some(at) = state.timer_for {
-        let job = job_name(&config.session, at);
+        let job = job_name(config.provider, &config.session, at);
         let active = if scheduler::exists(&job) { "programada" } else { "no está programada" };
         println!("tarea de regreso: {}, {active}", scheduler::describe(&job));
     }
@@ -636,12 +791,10 @@ fn status(config: &Config, limits: &[Limit], state: &State, action: &Action) {
 }
 
 fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
-    let _lock = lock_state(&config.state).map_err(|err| format!("no pude tomar el candado del estado: {err}"))?;
-    let before = load_state(&config.state);
-    let limits = read_limits(&config.meter).unwrap_or_else(|err| {
-        log(&err);
-        Vec::new()
-    });
+    let state_path = config.state_path();
+    let _lock = lock_state(&state_path).map_err(|err| format!("no pude tomar el candado del estado: {err}"))?;
+    let before = load_state(&state_path);
+    let limits = current_limits(config);
     let action = evaluate(&limits, &before, Utc::now(), config.threshold, config.margin);
     if config.mode == Mode::Status {
         status(config, &limits, &before, &action);
@@ -663,12 +816,12 @@ fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
             if let Some(wrap) = state.wrap.as_mut() {
                 wrap.resume_at = resume_at;
                 wrap.kinds = kinds;
-                log(&format!("el reinicio se recorre a {}", when_text(resume_at)));
+                log(&format!("{}: el reinicio se recorre a {}", config.provider.name(), when_text(resume_at)));
             }
         }
         Action::Resume => {
             if let Some(wrap) = state.wrap.take() {
-                state.wrap = resume(herdr, &wrap);
+                state.wrap = resume(config, herdr, &wrap);
             }
         }
     }
@@ -677,10 +830,14 @@ fn hook(config: &Config, herdr: &Herdr) -> Result<(), String> {
         return Ok(());
     }
     if config.dry_run {
-        log(&format!("[dry-run] estado nuevo: {}", serde_json::to_string(&state).unwrap_or_default()));
+        log(&format!(
+            "[dry-run] {}: estado nuevo: {}",
+            config.provider.name(),
+            serde_json::to_string(&state).unwrap_or_default()
+        ));
         return Ok(());
     }
-    save_state(&config.state, &state).map_err(|err| format!("no pude guardar el estado: {err}"))
+    save_state(&state_path, &state).map_err(|err| format!("no pude guardar el estado: {err}"))
 }
 
 fn main() -> ExitCode {
@@ -705,15 +862,19 @@ fn main() -> ExitCode {
         socket: config.socket.as_deref(),
         dry_run: config.dry_run,
     };
-    let result = hook(&config, &herdr);
+    let mut failed = false;
+    for provider in &config.providers {
+        let config = config.for_provider(*provider);
+        if !provider_present(&config) {
+            continue;
+        }
+        if let Err(err) = hook(&config, &herdr) {
+            log(&format!("{}: {err}", provider.name()));
+            failed = true;
+        }
+    }
     if let Some(job) = &config.job {
         scheduler::finish(&config, job);
     }
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            log(&err);
-            ExitCode::FAILURE
-        }
-    }
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

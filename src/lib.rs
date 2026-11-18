@@ -59,6 +59,99 @@ pub fn limits_from_statusline(raw: &str) -> Result<Vec<Limit>, serde_json::Error
         .collect())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Provider> {
+        Provider::ALL.into_iter().find(|provider| provider.id() == raw)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexWindow {
+    used_percent: f64,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimits {
+    limit_id: Option<String>,
+    primary: Option<CodexWindow>,
+    secondary: Option<CodexWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    rate_limits: Option<CodexRateLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexLine {
+    payload: CodexPayload,
+}
+
+pub fn window_kind(minutes: i64) -> String {
+    match minutes {
+        300 => "five_hour".into(),
+        10080 => "seven_day".into(),
+        minutes if minutes % 1440 == 0 => format!("{}_day", minutes / 1440),
+        minutes => format!("{minutes}_minute"),
+    }
+}
+
+pub fn limits_from_codex_rollout(text: &str) -> Option<Vec<Limit>> {
+    let rate_limits = text
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"rate_limits\""))
+        .filter_map(|line| serde_json::from_str::<CodexLine>(line).ok())
+        .filter(|line| line.payload.kind.as_deref() == Some("token_count"))
+        .filter_map(|line| line.payload.rate_limits)
+        .find(|limits| limits.limit_id.as_deref().is_none_or(|id| id == "codex"))?;
+    Some(
+        [rate_limits.primary, rate_limits.secondary]
+            .into_iter()
+            .flatten()
+            .filter_map(|window| {
+                Some(Limit {
+                    kind: window_kind(window.window_minutes?),
+                    percent_used: window.used_percent,
+                    resets_at: DateTime::from_timestamp(window.resets_at?, 0)?,
+                })
+            })
+            .collect(),
+    )
+}
+
+const SAME_WINDOW_SLACK_MINUTES: i64 = 5;
+
+fn same_window(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    (a - b).num_seconds().abs() < SAME_WINDOW_SLACK_MINUTES * 60
+}
+
 pub fn merge_limits(stored: &[Limit], fresh: &[Limit]) -> Vec<Limit> {
     let mut merged: Vec<Limit> = stored
         .iter()
@@ -67,11 +160,12 @@ pub fn merge_limits(stored: &[Limit], fresh: &[Limit]) -> Vec<Limit> {
         .collect();
     for new in fresh {
         let kept = match stored.iter().find(|old| old.kind == new.kind) {
-            Some(old) if old.resets_at > new.resets_at => old.clone(),
-            Some(old) if old.resets_at == new.resets_at => Limit {
+            Some(old) if same_window(old.resets_at, new.resets_at) => Limit {
+                kind: new.kind.clone(),
                 percent_used: old.percent_used.max(new.percent_used),
-                ..new.clone()
+                resets_at: old.resets_at.max(new.resets_at),
             },
+            Some(old) if old.resets_at > new.resets_at => old.clone(),
             _ => new.clone(),
         };
         merged.push(kept);
@@ -222,10 +316,10 @@ pub struct Agent {
     pub session: Option<String>,
 }
 
-pub fn wrap_up_targets(agents: &[Agent], event_pane: Option<&str>) -> Vec<PaneRef> {
+pub fn wrap_up_targets(agents: &[Agent], provider: Provider, event_pane: Option<&str>) -> Vec<PaneRef> {
     agents
         .iter()
-        .filter(|agent| agent.agent == "claude")
+        .filter(|agent| agent.agent == provider.id())
         .filter(|agent| {
             let just_finished = Some(agent.pane_id.as_str()) == event_pane
                 && matches!(agent.status.as_str(), "idle" | "done");
@@ -238,8 +332,8 @@ pub fn wrap_up_targets(agents: &[Agent], event_pane: Option<&str>) -> Vec<PaneRe
         .collect()
 }
 
-pub fn catch_up_targets(agents: &[Agent], event_pane: Option<&str>, wrap: &Wrap) -> Vec<PaneRef> {
-    wrap_up_targets(agents, event_pane)
+pub fn catch_up_targets(agents: &[Agent], provider: Provider, event_pane: Option<&str>, wrap: &Wrap) -> Vec<PaneRef> {
+    wrap_up_targets(agents, provider, event_pane)
         .into_iter()
         .filter(|pane| wrap.panes.iter().all(|asked| asked.pane_id != pane.pane_id))
         .collect()
@@ -380,11 +474,16 @@ pub fn evaluate(
     }
 }
 
-pub fn kind_label(kind: &str) -> &str {
+pub fn kind_label(kind: &str) -> String {
     match kind {
-        "five_hour" => "de 5 h",
-        "seven_day" => "semanal",
-        other => other,
+        "five_hour" => "de 5 h".into(),
+        "seven_day" => "semanal".into(),
+        other => match other.split_once('_') {
+            Some(("1", "day")) => "de 1 día".into(),
+            Some((count, "day")) => format!("de {count} días"),
+            Some((count, "minute")) => format!("de {count} min"),
+            _ => other.into(),
+        },
     }
 }
 
@@ -526,11 +625,99 @@ mod tests {
             agent("w1:p4", "codex", "working"),
             agent("w1:p5", "claude", "blocked"),
         ];
-        let targets: Vec<String> = wrap_up_targets(&agents, Some("w1:p2"))
+        let targets: Vec<String> = wrap_up_targets(&agents, Provider::Claude, Some("w1:p2"))
             .into_iter()
             .map(|pane| pane.pane_id)
             .collect();
         assert_eq!(targets, ["w1:p1", "w1:p2"]);
+    }
+
+    #[test]
+    fn codex_limits_only_reach_codex_panes() {
+        let agents = [
+            agent("w1:p1", "claude", "working"),
+            agent("w1:p2", "codex", "working"),
+            agent("w1:p3", "codex", "idle"),
+            agent("w1:p4", "codex", "done"),
+        ];
+        let targets: Vec<String> = wrap_up_targets(&agents, Provider::Codex, Some("w1:p4"))
+            .into_iter()
+            .map(|pane| pane.pane_id)
+            .collect();
+        assert_eq!(targets, ["w1:p2", "w1:p4"]);
+    }
+
+    #[test]
+    fn providers_parse_from_their_ids() {
+        assert_eq!(Provider::parse("claude"), Some(Provider::Claude));
+        assert_eq!(Provider::parse("codex"), Some(Provider::Codex));
+        assert_eq!(Provider::parse("gemini"), None);
+    }
+
+    fn token_count(rate_limits: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-11-18T16:16:08.624Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"total_tokens":10}}}},"rate_limits":{rate_limits}}}}}"#
+        )
+    }
+
+    #[test]
+    fn reads_the_last_codex_reading_of_a_rollout() {
+        let older = token_count(
+            r#"{"limit_id":"codex","primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1789208389},"secondary":{"used_percent":25.0,"window_minutes":10080,"resets_at":1789541542},"plan_type":"plus"}"#,
+        );
+        let newer = token_count(
+            r#"{"limit_id":"codex","primary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1795402180},"secondary":null,"plan_type":"plus"}"#,
+        );
+        let message = r#"{"type":"response_item","payload":{"type":"message","content":[{"text":"el campo \"rate_limits\" trae el uso"}]}}"#;
+        let rollout = format!("tos\":1}}\n{older}\n{newer}\n{message}\n");
+        let limits = limits_from_codex_rollout(&rollout).unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].kind, "seven_day");
+        assert_eq!(limits[0].percent_used, 7.0);
+        assert_eq!(limits[0].resets_at.timestamp(), 1795402180);
+
+        let both = limits_from_codex_rollout(&older).unwrap();
+        let kinds: Vec<&str> = both.iter().map(|limit| limit.kind.as_str()).collect();
+        assert_eq!(kinds, ["five_hour", "seven_day"]);
+    }
+
+    #[test]
+    fn codex_rollout_without_readings_gives_nothing() {
+        assert_eq!(limits_from_codex_rollout(""), None);
+        assert_eq!(limits_from_codex_rollout(&token_count("null")), None);
+        let other_limit = token_count(
+            r#"{"limit_id":"other","primary":{"used_percent":99.0,"window_minutes":300,"resets_at":1789208389}}"#,
+        );
+        assert_eq!(limits_from_codex_rollout(&other_limit), None);
+    }
+
+    #[test]
+    fn codex_windows_are_named_by_their_length() {
+        assert_eq!(window_kind(300), "five_hour");
+        assert_eq!(window_kind(10080), "seven_day");
+        assert_eq!(window_kind(43200), "30_day");
+        assert_eq!(window_kind(90), "90_minute");
+        assert_eq!(kind_label("30_day"), "de 30 días");
+        assert_eq!(kind_label("1_day"), "de 1 día");
+        assert_eq!(kind_label("90_minute"), "de 90 min");
+        assert_eq!(kind_label("seven_day"), "semanal");
+    }
+
+    #[test]
+    fn reset_times_a_few_seconds_apart_are_the_same_window() {
+        let stored = Limit {
+            kind: "seven_day".into(),
+            percent_used: 40.0,
+            resets_at: at(10) + Duration::seconds(2),
+        };
+        let fresh = Limit {
+            kind: "seven_day".into(),
+            percent_used: 55.0,
+            resets_at: at(10),
+        };
+        let merged = merge_limits(&[stored.clone()], &[fresh]);
+        assert_eq!(merged[0].percent_used, 55.0);
+        assert_eq!(merged[0].resets_at, stored.resets_at);
     }
 
     #[test]
@@ -687,7 +874,7 @@ mod tests {
             agent("w1:p2", "claude", "working"),
             agent("w1:p3", "claude", "idle"),
         ];
-        let targets: Vec<String> = catch_up_targets(&agents, None, &wrap_with(&["w1:p1"], 0))
+        let targets: Vec<String> = catch_up_targets(&agents, Provider::Claude, None, &wrap_with(&["w1:p1"], 0))
             .into_iter()
             .map(|pane| pane.pane_id)
             .collect();

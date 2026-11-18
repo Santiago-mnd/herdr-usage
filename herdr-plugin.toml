@@ -1,8 +1,8 @@
 id = "herdr-usage"
 name = "herdr-usage"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.5"
-description = "Pide un cierre ordenado a los panes de Claude cuando el uso del plan llega al límite y los retoma cuando se reinicia"
+description = "Pide un cierre ordenado a los panes de Claude y de Codex cuando el uso del plan llega al límite y los retoma cuando se reinicia"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]
